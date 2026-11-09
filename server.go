@@ -363,7 +363,8 @@ func (l *Lair) hug(ctx context.Context, mc *Tunnel, target string) bool {
 	}
 	defer up.Close()
 
-	return newNest(l, mc, up).run()
+	_, port, _ := net.SplitHostPort(target)
+	return newNest(l, mc, up, tlsLike(port)).run()
 }
 
 func errnoOf(err error) byte {
@@ -504,7 +505,7 @@ type nest struct {
 	gatherFinish chan struct{}
 }
 
-func newNest(srv *Lair, tun *Tunnel, target net.Conn) *nest {
+func newNest(srv *Lair, tun *Tunnel, target net.Conn, inner bool) *nest {
 	cfg := srv.cfg
 	n := &nest{
 		srv:          srv,
@@ -519,7 +520,7 @@ func newNest(srv *Lair, tun *Tunnel, target net.Conn) *nest {
 		Tail:  cfg.SendTail,
 		Quiet: cfg.SendQuiet,
 		Head:  Headroom,
-		Plan:  personaPlan(false, 0, 0),
+		Plan:  personaPlan(false, inner, 0),
 		Pad:   true,
 		Fill:  personaFill,
 	}, n.write)
