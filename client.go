@@ -32,7 +32,6 @@ type Kitten struct {
 
 	hinted  atomic.Bool
 	firstUp atomic.Bool
-	adapt   *adapter
 	sem     chan struct{}
 	kick    chan struct{}
 
@@ -81,7 +80,6 @@ func NewKitten(cfg ClientConfig, logger *slog.Logger) (*Kitten, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	k := &Kitten{
-		adapt:    newAdapter(logger, cfg.adaptWindow),
 		cfg:      cfg,
 		logger:   logger,
 		sem:      make(chan struct{}, spawnCap),
@@ -246,14 +244,11 @@ func (k *Kitten) spawn() {
 	fails := k.fails
 	k.mu.Unlock()
 	if err == nil {
-		k.adapt.handshakeOK()
 		if was >= 3 {
 			k.logger.Info("tunnels to the server are working again")
 		} else if k.firstUp.CompareAndSwap(false, true) {
 			k.logger.Info("first tunnel to the server is up")
 		}
-	} else {
-		k.adapt.handshakeFailed(fails)
 	}
 
 	if err == nil {
@@ -315,7 +310,6 @@ func (k *Kitten) tick() {
 		k.logger.Debug("pool want adjusted", "want", now, "prev", prev)
 	}
 	k.pool.sweep()
-	k.adapt.cool()
 	k.retune()
 }
 
@@ -368,7 +362,7 @@ func (k *Kitten) lease(ctx context.Context) (*purrConn, error) {
 		k.mu.Lock()
 		k.hits++
 		k.mu.Unlock()
-		return &purrConn{mc: mc, home: k.pool, ad: k.adapt, uses: uses + 1}, nil
+		return k.fresh(&purrConn{mc: mc, home: k.pool, uses: uses + 1}), nil
 	}
 	k.mu.Lock()
 	k.miss++
@@ -378,7 +372,22 @@ func (k *Kitten) lease(ctx context.Context) (*purrConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &purrConn{mc: mc, home: k.pool, ad: k.adapt, uses: 1}, nil
+	return k.fresh(&purrConn{mc: mc, home: k.pool, uses: 1}), nil
+}
+
+func (k *Kitten) drainWindow() time.Duration {
+	d := clientDrain
+	if rtt := time.Duration(k.scout.avgRTT()) * 2; rtt > d {
+		d = min(rtt, maxDrain)
+	}
+	return d
+}
+
+func (k *Kitten) fresh(pc *purrConn) *purrConn {
+	if !pc.mc.life.drawn() {
+		pc.mc.life = newLife(k.cfg.PoolMaxUses)
+	}
+	return pc
 }
 
 func (k *Kitten) dialTCP(ctx context.Context, host string, port uint16) (*purrConn, error) {
@@ -391,6 +400,7 @@ func (k *Kitten) dialTCP(ctx context.Context, host string, port uint16) (*purrCo
 		return nil, err
 	}
 	pc.first = hello
+	pc.inner = tlsLike(strconv.Itoa(int(port)))
 	if !pc.mc.sealed {
 		pc.first = append(MakeProof(k.scout.id, pc.mc.bind), hello...)
 		pc.mc.sealed = true
@@ -398,9 +408,9 @@ func (k *Kitten) dialTCP(ctx context.Context, host string, port uint16) (*purrCo
 	return pc, nil
 }
 
-func (k *Kitten) flight(first int) (plan []Range, pad bool, fill time.Duration) {
+func (k *Kitten) flight(first int, inner bool) (plan []Range, pad bool, fill time.Duration) {
 	if len(k.plan) == 0 {
-		return personaPlan(true, k.adapt.level(), first), true, personaFill
+		return personaPlan(true, inner, first), true, personaFill
 	}
 	plan = append([]Range(nil), k.plan...)
 	plan[0].Min = max(plan[0].Min, first)
@@ -573,15 +583,14 @@ type purrConn struct {
 	home    *purrPool
 	uses    int
 	first   []byte
-	ad      *adapter
+	inner   bool
 	napSent atomic.Bool
 	napSeen atomic.Bool
 	broken  atomic.Bool
 }
 
 func (p *purrConn) release() {
-	limit := p.ad.usesCap(p.home.maxUses)
-	if p.broken.Load() || !p.napSent.Load() || !p.napSeen.Load() || p.ad.spent(p.mc.Moved()) || (limit > 0 && p.uses >= limit) {
+	if p.broken.Load() || !p.napSent.Load() || !p.napSeen.Load() || p.mc.Dirty() || p.mc.life.spent(p.uses, p.mc.Moved()) {
 		_ = p.mc.Close()
 		return
 	}
@@ -594,6 +603,7 @@ const (
 	raceStep    = 50 * time.Millisecond
 	dnsTTL      = 30 * time.Second
 	clientDrain = 500 * time.Millisecond
+	maxDrain    = 5 * time.Second
 )
 
 const (
@@ -849,7 +859,6 @@ type shuttleRun struct {
 	pc     *purrConn
 	target string
 	gate   *Gate
-	watch  *rateWatch
 
 	downDone atomic.Bool
 	appDead  atomic.Bool
@@ -858,8 +867,7 @@ type shuttleRun struct {
 
 func (k *Kitten) shuttle(app net.Conn, pc *purrConn, target string) {
 	s := &shuttleRun{cli: k, app: app, pc: pc, target: target}
-	plan, pad, fill := k.flight(len(pc.first))
-	s.watch = newRateWatch(k.adapt, pc.mc.Moved)
+	plan, pad, fill := k.flight(len(pc.first), pc.inner)
 	s.gate = NewGate(GateOptions{
 		Pack:  k.cfg.SendPack,
 		Tail:  k.cfg.SendTail,
@@ -905,7 +913,6 @@ func (s *shuttleRun) deliver(p []byte) {
 		s.kickApp()
 		return
 	}
-	s.watch.add(len(p))
 }
 
 func (s *shuttleRun) downstream() {
@@ -973,7 +980,7 @@ func (s *shuttleRun) upstream() {
 		s.pc.broken.Store(true)
 		return
 	}
-	_ = s.pc.mc.SetReadDeadline(time.Now().Add(clientDrain))
+	_ = s.pc.mc.SetReadDeadline(time.Now().Add(s.cli.drainWindow()))
 }
 
 var (
