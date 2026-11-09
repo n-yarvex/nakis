@@ -155,6 +155,7 @@ type Tunnel struct {
 	moved  atomic.Int64
 	bind   []byte
 	sealed bool
+	life   lifespan
 }
 
 func WrapTunnel(c net.Conn, b *Batcher) *Tunnel {
@@ -197,6 +198,18 @@ func (c *Tunnel) pull() ([]byte, error) {
 }
 
 func (c *Tunnel) Moved() int64 { return c.moved.Load() }
+
+func (c *Tunnel) Dirty() bool {
+	c.rMu.Lock()
+	defer c.rMu.Unlock()
+	if len(c.rest) > 0 || len(c.held) > 0 {
+		return true
+	}
+	if br, ok := c.rd.(*bufio.Reader); ok && br.Buffered() > 0 {
+		return true
+	}
+	return false
+}
 
 func (c *Tunnel) ReadFirst(idle, rest time.Duration) (frame, prefix []byte, err error) {
 	var h [2]byte
