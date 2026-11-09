@@ -400,6 +400,7 @@ build_binary() {
 install_self() {
   local from=
   if [ -f "$SELF" ] && [ "$(basename "$SELF")" != bash ]; then from=$SELF
+  elif [ -f "$SRC/tool/nakis-install.sh" ]; then from=$SRC/tool/nakis-install.sh
   elif [ -f "$SRC/nakis-install.sh" ]; then from=$SRC/nakis-install.sh; fi
   [ -n "$from" ] || return 0
   [ "$from" -ef "$CTL" ] && return 0
