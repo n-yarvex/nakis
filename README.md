@@ -57,7 +57,7 @@ Nakis 是一个基于 go 开发的 SOCKS5 入口 + TLS 隧道的轻量代理协�
 
 ### 🧰 服务端一键脚本
 
-[`nakis-install.sh`](nakis-install.sh)：只管服务端，装好后自带管理菜单（改配置、看链接和订阅、启停、日志、更新、换 uuid / 证书 / ECH 密钥、体检、卸载）。能交互问的参数都会问（也能全部用环境变量无人值守），装完直接给你分享链接和订阅文本。
+[`nakis-install.sh`](tool/nakis-install.sh)：只管服务端，装好后自带管理菜单（改配置、看链接和订阅、启停、日志、更新、换 uuid / 证书 / ECH 密钥、体检、卸载）。能交互问的参数都会问（也能全部用环境变量无人值守），装完直接给你分享链接和订阅文本。
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/n-yarvex/nakis/refs/heads/main/tool/nakis-install.sh && bash nakis-install.sh
