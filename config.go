@@ -64,8 +64,7 @@ type ClientConfig struct {
 	TLSPins          []string `json:"tls_pins"`
 	ECHConfig        string   `json:"ech_config"`
 
-	noWarm      bool
-	adaptWindow time.Duration
+	noWarm bool
 }
 
 type ServerConfig struct {
