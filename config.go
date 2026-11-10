@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -182,6 +184,72 @@ func FixListen(addr string) string {
 	return net.JoinHostPort(host, port)
 }
 
+func normHost(h string) (string, error) {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return "", errors.New("host is empty")
+	}
+	if strings.ContainsRune(h, '%') {
+		return "", fmt.Errorf("host %q must not carry a zone", h)
+	}
+	if a, err := netip.ParseAddr(h); err == nil {
+		return a.String(), nil
+	}
+	h = strings.TrimSuffix(h, ".")
+	if h == "" || len(h) > 253 || h[0] == '.' || strings.Contains(h, "..") {
+		return "", fmt.Errorf("host %q is not a valid name", h)
+	}
+	for _, r := range h {
+		if r <= 0x20 || r == 0x7f || strings.ContainsRune(`/\?#@,[]:"'<>`, r) {
+			return "", fmt.Errorf("host %q is not a valid name", h)
+		}
+	}
+	return strings.ToLower(h), nil
+}
+
+func normServer(s string) (string, error) {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(s))
+	if err != nil {
+		return "", fmt.Errorf("server %q: %w", s, err)
+	}
+	n, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || n < 1 {
+		return "", fmt.Errorf("server %q: port must be 1-65535", s)
+	}
+	if strings.ContainsRune(host, '%') {
+		a, perr := netip.ParseAddr(host)
+		if perr != nil || a.Zone() == "" {
+			return "", fmt.Errorf("server %q: bad address", s)
+		}
+		host = a.String()
+	} else if host, err = normHost(host); err != nil {
+		return "", fmt.Errorf("server %q: %w", s, err)
+	}
+	return net.JoinHostPort(host, strconv.Itoa(int(n))), nil
+}
+
+func normServers(list string) (string, error) {
+	var out []string
+	seen := map[string]bool{}
+	for _, item := range strings.Split(list, ",") {
+		if strings.TrimSpace(item) == "" {
+			continue
+		}
+		s, err := normServer(item)
+		if err != nil {
+			return "", err
+		}
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	if len(out) == 0 {
+		return "", errors.New("server is required")
+	}
+	return strings.Join(out, ","), nil
+}
+
 func (c *ClientConfig) Tidy() error {
 	if c.Server == "" {
 		return errors.New("server is required")
@@ -189,9 +257,14 @@ func (c *ClientConfig) Tidy() error {
 	if _, err := ParseUUID(c.UUID); err != nil {
 		return fmt.Errorf("uuid: %w", err)
 	}
-	for _, s := range strings.Split(c.Server, ",") {
-		if _, _, err := net.SplitHostPort(strings.TrimSpace(s)); err != nil {
-			return fmt.Errorf("server %q: %w", s, err)
+	servers, err := normServers(c.Server)
+	if err != nil {
+		return err
+	}
+	c.Server = servers
+	if c.SNI != "" {
+		if c.SNI, err = normHost(c.SNI); err != nil {
+			return fmt.Errorf("sni: %w", err)
 		}
 	}
 	c.Listen = FixListen(c.Listen)
