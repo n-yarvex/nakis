@@ -68,11 +68,15 @@ func decodeB64(s string) ([]byte, error) {
 }
 
 func FormatLink(c ClientConfig, name string) (string, error) {
-	servers := strings.Split(c.Server, ",")
-	for i := range servers {
-		servers[i] = strings.TrimSpace(servers[i])
-		if _, _, err := net.SplitHostPort(servers[i]); err != nil {
-			return "", fmt.Errorf("server %q: %w", servers[i], err)
+	list, err := normServers(c.Server)
+	if err != nil {
+		return "", err
+	}
+	servers := strings.Split(list, ",")
+	sni := ""
+	if c.SNI != "" {
+		if sni, err = normHost(c.SNI); err != nil {
+			return "", fmt.Errorf("sni: %w", err)
 		}
 	}
 	id, err := ParseUUID(c.UUID)
@@ -84,8 +88,8 @@ func FormatLink(c ClientConfig, name string) (string, error) {
 	if !c.TLS {
 		q["tls"] = "0"
 	} else {
-		if c.SNI != "" {
-			q["sni"] = c.SNI
+		if sni != "" {
+			q["sni"] = sni
 		}
 		if len(c.TLSPins) > 0 {
 			pins := make([]string, len(c.TLSPins))
@@ -197,21 +201,19 @@ func ParseLink(link string) (Node, error) {
 	c.UUID = u.User.Username()
 	c.Server = net.JoinHostPort(u.Hostname(), u.Port())
 	if alt := q.Get("alt"); alt != "" {
-		for _, a := range strings.Split(alt, ",") {
-			a = strings.TrimSpace(a)
-			if a == "" {
-				continue
-			}
-			if _, _, err := net.SplitHostPort(a); err != nil {
-				return n, fmt.Errorf("alt %q: %w", a, err)
-			}
-			c.Server += "," + a
-		}
+		c.Server += "," + alt
+	}
+	if c.Server, err = normServers(c.Server); err != nil {
+		return n, err
 	}
 	if q.Get("tls") == "0" {
 		c.TLS = false
 	}
-	c.SNI = q.Get("sni")
+	if s := q.Get("sni"); s != "" {
+		if c.SNI, err = normHost(s); err != nil {
+			return n, fmt.Errorf("sni: %w", err)
+		}
+	}
 	if p := q.Get("pin"); p != "" {
 		for _, item := range strings.Split(p, ",") {
 			norm, err := normalizePin(item)
