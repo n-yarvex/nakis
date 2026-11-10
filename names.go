@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -13,6 +14,68 @@ const (
 	capacity = 8192
 	retryAt  = 5 * time.Second
 )
+
+const dnsAttempt = 3 * time.Second
+
+type DNSPool struct {
+	servers []string
+	res     []*net.Resolver
+	pref    atomic.Int32
+}
+
+func NewDNSPool(entries []string) *DNSPool {
+	p := &DNSPool{}
+	for _, e := range entries {
+		host := strings.TrimSpace(e)
+		if host == "" {
+			continue
+		}
+		if _, _, err := net.SplitHostPort(host); err != nil {
+			host = net.JoinHostPort(strings.Trim(host, "[]"), "53")
+		}
+		p.servers = append(p.servers, host)
+		addr := host
+		p.res = append(p.res, &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, addr)
+			},
+		})
+	}
+	if len(p.res) == 0 {
+		return nil
+	}
+	return p
+}
+
+func (p *DNSPool) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
+	n := len(p.res)
+	start := int(p.pref.Load()) % n
+	var last error
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		actx, cancel := ctx, context.CancelFunc(func() {})
+		if n > 1 {
+			actx, cancel = context.WithTimeout(ctx, dnsAttempt)
+		}
+		ips, err := p.res[idx].LookupIPAddr(actx, host)
+		cancel()
+		if err == nil {
+			p.pref.Store(int32(idx))
+			return ips, nil
+		}
+		var de *net.DNSError
+		if errors.As(err, &de) && de.IsNotFound {
+			return nil, err
+		}
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		last = err
+	}
+	return nil, last
+}
 
 type LookupFunc func(ctx context.Context, host string) ([]net.IPAddr, error)
 
