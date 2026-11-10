@@ -264,7 +264,24 @@ port_in_use() {
   fi
 }
 
-port_open() { ( exec 3<>"/dev/tcp/127.0.0.1/$1" ) 2>/dev/null; }
+port_open() { ( exec 3<>"/dev/tcp/$1/$2" ) 2>/dev/null; }
+
+probe_hosts() {
+  local h
+  case "${BIND:-}" in
+    ""|0.0.0.0) echo 127.0.0.1 ;;
+    ::|"[::]") echo ::1; echo 127.0.0.1 ;;
+    *) h=${BIND#\[}; echo "${h%\]}" ;;
+  esac
+}
+
+listening() {
+  local h
+  while IFS= read -r h; do
+    port_open "$h" "$PORT" && return 0
+  done < <(probe_hosts)
+  return 1
+}
 
 # ---------------------------------------------------------------- 依赖 ----
 
@@ -398,13 +415,26 @@ build_binary() {
 }
 
 install_self() {
-  local from=
-  if [ -f "$SELF" ] && [ "$(basename "$SELF")" != bash ]; then from=$SELF
-  elif [ -f "$SRC/tool/nakis-install.sh" ]; then from=$SRC/tool/nakis-install.sh
-  elif [ -f "$SRC/nakis-install.sh" ]; then from=$SRC/nakis-install.sh; fi
+  local from= fresh=${1:-}
+  if [ "$fresh" = fresh ]; then
+    if [ -f "$SRC/tool/nakis-install.sh" ]; then from=$SRC/tool/nakis-install.sh
+    elif [ -f "$SRC/nakis-install.sh" ]; then from=$SRC/nakis-install.sh; fi
+  fi
+  if [ -z "$from" ]; then
+    if [ -f "$SELF" ] && [ "$(basename "$SELF")" != bash ]; then from=$SELF
+    elif [ -f "$SRC/tool/nakis-install.sh" ]; then from=$SRC/tool/nakis-install.sh
+    elif [ -f "$SRC/nakis-install.sh" ]; then from=$SRC/nakis-install.sh; fi
+  fi
   [ -n "$from" ] || return 0
   [ "$from" -ef "$CTL" ] && return 0
-  mkdir -p "$BIN_DIR" && install -m 0755 "$from" "$CTL" 2>/dev/null
+  [ -f "$CTL" ] && cmp -s "$from" "$CTL" && return 0
+  local tmp="$CTL.new.$$"
+  if mkdir -p "$BIN_DIR" && cp "$from" "$tmp" 2>/dev/null && chmod 0755 "$tmp" && mv -f "$tmp" "$CTL" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp"
+  warn "管理脚本没能更新到 $CTL，请手动重新下载安装脚本"
+  return 1
 }
 
 # ---------------------------------------------------------------- 生成材料 ----
@@ -450,7 +480,10 @@ make_ech() {
 }
 
 render_server_json() {
-  local listen=$BIND dns= first=1 d
+  local listen=$BIND dns= first=1 d ech_json=
+  if [ "$TLS_MODE" != plain ] && [ "$ECH" = 1 ]; then
+    ech_json=$(cat "$CONF/ech_keys.json" 2>/dev/null) && [ -n "$ech_json" ] || { warn "读不到 ECH 密钥：$CONF/ech_keys.json"; return 1; }
+  fi
   [[ "$listen" == *:* ]] && listen="[$listen]"
   listen="$listen:$PORT"
   if [ -n "$DNS" ]; then
@@ -483,7 +516,7 @@ render_server_json() {
       echo "  \"tls\": true,"
       echo "  \"tls_cert\": \"$CONF/cert.pem\","
       echo "  \"tls_key\": \"$CONF/key.pem\"$([ "$ECH" = 1 ] && echo ,)"
-      if [ "$ECH" = 1 ]; then echo "  \"ech_keys\": $(cat "$CONF/ech_keys.json")"; fi
+      if [ "$ECH" = 1 ]; then echo "  \"ech_keys\": $ech_json"; fi
     fi
     echo "}"
   } | write_file "$CONF/server.json" 640
@@ -634,8 +667,8 @@ apply_config() { # 写文件 + 证书 + 重启
       make_ech; echo "$ECH_PUBLIC" >"$CONF/ech.public"
     fi
   fi
-  save_settings
-  render_server_json
+  save_settings || die "保存设置失败"
+  render_server_json || die "写入 server.json 失败"
   ( build_links ) >/dev/null 2>&1 ||
     warn "配置文件已写入，但生成链接没通过校验（多半是 sni / 证书设置不匹配），请用 nakisctl link 查看详情"
   tune_congestion
@@ -663,31 +696,34 @@ prepare_service_user() {
 log_file() { printf '%s/server.log' "$STATE"; }
 pid_file() { printf '%s/server.pid' "$STATE"; }
 
-bg_alive() {
-  local pf; pf=$(pid_file)
-  [ -f "$pf" ] && kill -0 "$(cat "$pf" 2>/dev/null)" 2>/dev/null
-}
-
-is_nakis_pid() {
-  local pid=$1
+proc_is() { # pid 命令行里必须出现的片段（防止 pid 被别的进程复用后误杀）
+  local pid=$1 want=$2 cmd=
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
-  if [ -r "/proc/$pid/cmdline" ]; then tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q nakis; else ps -p "$pid" -o args= 2>/dev/null | grep -q nakis; fi
+  if [ -r "/proc/$pid/cmdline" ]; then cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)
+  else cmd=$(ps -p "$pid" -o args= 2>/dev/null); fi
+  [[ "$cmd" == *"$want"* ]]
+}
+
+bg_alive() {
+  proc_is "$(cat "$(pid_file)" 2>/dev/null)" "$STATE/server.run"
+}
+
+stop_pid() {
+  local pid=$1 want=$2 tries=$3 i
+  proc_is "$pid" "$want" || return 0
+  kill "$pid" 2>/dev/null
+  for i in $(seq 1 "$tries"); do proc_is "$pid" "$want" || return 0; sleep 0.5; done
+  proc_is "$pid" "$want" && kill -9 "$pid" 2>/dev/null
+  return 0
 }
 
 bg_stop() {
-  local pf cf pid child i
+  local pf cf pid child
   pf=$(pid_file); cf="$STATE/server.child"
   pid=$(cat "$pf" 2>/dev/null); child=$(cat "$cf" 2>/dev/null)
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    kill "$pid" 2>/dev/null
-    for i in $(seq 1 16); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
-    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
-  fi
-  if is_nakis_pid "$child"; then
-    for i in 1 2 3 4; do is_nakis_pid "$child" || break; sleep 0.5; done
-    is_nakis_pid "$child" && kill -9 "$child" 2>/dev/null
-  fi
+  stop_pid "$pid" "$STATE/server.run" 16
+  stop_pid "$child" "$BIN" 4
   rm -f "$pf" "$cf"
 }
 
@@ -782,11 +818,20 @@ follow_log() {
   else echo "（还没有日志）"; fi
 }
 
+server_sig() {
+  if has_unit; then systemctl show -p MainPID --value "$UNIT" 2>/dev/null
+  else cat "$STATE/server.child" 2>/dev/null; fi
+}
+
 wait_listening() {
-  local i
+  local i s1 s2
   for i in $(seq 1 24); do
-    if port_open "$PORT"; then return 0; fi
-    sleep 0.5
+    if server_alive && listening; then
+      s1=$(server_sig); sleep 1; s2=$(server_sig)
+      if [ "$s1" = "$s2" ] && server_alive && listening; then return 0; fi
+    else
+      sleep 0.5
+    fi
   done
   return 1
 }
@@ -854,7 +899,8 @@ do_config() {
 
 do_update() {
   is_installed || die "还没有安装，请先运行：nakisctl install"
-  ensure_tools; ensure_go; fetch_source; build_binary; install_self
+  ensure_tools; ensure_go; fetch_source; build_binary
+  install_self fresh || true
   load_settings
   apply_config
   restart_and_report
@@ -892,7 +938,7 @@ do_check() {
   load_settings
   echo "系统：$(uname -sm)  布局：$LAYOUT  systemd：$(use_systemd && echo 是 || echo 否)"
   [ -x "$BIN" ] && echo "程序：$BIN（$("$BIN" version 2>/dev/null)）" || echo "程序：未安装"
-  echo "监听端口 $PORT：$(port_open "$PORT" && echo 正在监听 || echo 未监听)"
+  echo "监听端口 $PORT：$(listening && echo 正在监听 || echo 未监听)"
   local ip; ip=$(detect_ip); echo "公网 IPv4：${ip:-取不到}"
   if [ -n "$HOSTS" ] && [ -n "$ip" ] && [[ "$HOSTS" =~ ^[0-9.,]+$ ]] && [[ ",$HOSTS," != *",$ip,"* ]]; then
     warn "配置里的地址（$HOSTS）和本机公网 IP（$ip）不一致，如果不是 NAT / 转发请用 nakisctl config 修改"
@@ -910,7 +956,7 @@ do_status() {
   load_settings
   if server_alive; then ok "服务运行中"; else warn "服务没有运行"; fi
   echo "  程序版本：$("$BIN" version 2>/dev/null)"
-  echo "  监听：$BIND:$PORT（本机 $(port_open "$PORT" && echo 可连接 || echo 连不上)）"
+  echo "  监听：$BIND:$PORT（本机 $(listening && echo 可连接 || echo 连不上)）"
   echo "  加密：$TLS_MODE，ECH：$([ "$ECH" = 1 ] && echo "开（$ECH_PUBLIC）" || echo 关)"
   echo "  地址：$HOSTS    节点名：$NODE_NAME"
   echo "  uuid：${UUID:0:8}…"
