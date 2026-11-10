@@ -289,6 +289,7 @@ func (g *Gate) onFill(id uint64) {
 }
 
 func (g *Gate) shapeDrain(force bool) {
+	emitted := false
 	for g.shaping() && len(g.acc) > 0 {
 		r := g.opt.Plan[g.idx]
 		if len(g.acc) < r.Min && !force {
@@ -305,8 +306,11 @@ func (g *Gate) shapeDrain(force bool) {
 		}
 		g.acc = g.acc[:copy(g.acc, g.acc[n:])]
 		g.idx++
+		emitted = true
 	}
-	g.fillDisarm()
+	if emitted || !g.shaping() || len(g.acc) == 0 {
+		g.fillDisarm()
+	}
 	if g.shaping() {
 		if len(g.acc) > 0 {
 			g.fillArm()
