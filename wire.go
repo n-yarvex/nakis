@@ -199,16 +199,29 @@ func (c *Tunnel) pull() ([]byte, error) {
 
 func (c *Tunnel) Moved() int64 { return c.moved.Load() }
 
+var longAgo = time.Unix(1, 0)
+
 func (c *Tunnel) Dirty() bool {
 	c.rMu.Lock()
 	defer c.rMu.Unlock()
 	if len(c.rest) > 0 || len(c.held) > 0 {
 		return true
 	}
-	if br, ok := c.rd.(*bufio.Reader); ok && br.Buffered() > 0 {
+	br, buffered := c.rd.(*bufio.Reader)
+	if buffered && br.Buffered() > 0 {
 		return true
 	}
-	return false
+	_ = c.Conn.SetReadDeadline(longAgo)
+	var err error
+	if buffered {
+		_, err = br.Peek(1)
+	} else {
+		var one [1]byte
+		_, err = c.rd.Read(one[:])
+	}
+	_ = c.Conn.SetReadDeadline(time.Time{})
+	var ne net.Error
+	return !(errors.As(err, &ne) && ne.Timeout())
 }
 
 func (c *Tunnel) ReadFirst(idle, rest time.Duration) (frame, prefix []byte, err error) {
