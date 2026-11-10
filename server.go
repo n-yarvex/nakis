@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,13 +29,16 @@ type Lair struct {
 	slots    chan struct{}
 	names    *NameCache
 	logger   *slog.Logger
-	resolver *net.Resolver
+	resolver *DNSPool
 	tlsCfg   *tls.Config
 
-	mu    sync.Mutex
-	conns map[net.Conn]struct{}
-	wg    sync.WaitGroup
+	mu      sync.Mutex
+	conns   map[net.Conn]*connMark
+	closing bool
+	wg      sync.WaitGroup
 }
+
+type connMark struct{ busy atomic.Bool }
 
 func NewLair(cfg ServerConfig, logger *slog.Logger) (*Lair, error) {
 	id, err := ParseUUID(cfg.UUID)
@@ -44,7 +48,7 @@ func NewLair(cfg ServerConfig, logger *slog.Logger) (*Lair, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	l := &Lair{cfg: cfg, guard: NewGuard(id), slots: make(chan struct{}, cfg.MaxConns), logger: logger, conns: map[net.Conn]struct{}{}}
+	l := &Lair{cfg: cfg, guard: NewGuard(id), slots: make(chan struct{}, cfg.MaxConns), logger: logger, conns: map[net.Conn]*connMark{}}
 	if cfg.TLS {
 		l.tlsCfg, err = TLSServerConfig(ServerOptions{
 			CertFile: cfg.TLSCert,
@@ -55,7 +59,7 @@ func NewLair(cfg ServerConfig, logger *slog.Logger) (*Lair, error) {
 			return nil, err
 		}
 	}
-	l.resolver = buildResolver(cfg.DNS)
+	l.resolver = NewDNSPool(cfg.DNS)
 	lookup := net.DefaultResolver.LookupIPAddr
 	if l.resolver != nil {
 		lookup = l.resolver.LookupIPAddr
@@ -77,38 +81,6 @@ func NewLair(cfg ServerConfig, logger *slog.Logger) (*Lair, error) {
 	return l, nil
 }
 
-func buildResolver(entries []string) *net.Resolver {
-	var servers []string
-	for _, e := range entries {
-		host := strings.TrimSpace(e)
-		if host == "" {
-			continue
-		}
-		if _, _, err := net.SplitHostPort(host); err != nil {
-			host = net.JoinHostPort(host, "53")
-		}
-		servers = append(servers, host)
-	}
-	if len(servers) == 0 {
-		return nil
-	}
-	return &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 5 * time.Second}
-			lastErr := errors.New("no DNS server reachable")
-			for _, sv := range servers {
-				conn, err := d.DialContext(ctx, network, sv)
-				if err == nil {
-					return conn, nil
-				}
-				lastErr = err
-			}
-			return nil, lastErr
-		},
-	}
-}
-
 func (l *Lair) warnCongestion(err error) {
 	l.logger.Warn("couldn't switch the congestion control, carrying on with the system default", "wanted", l.cfg.Congestion, "err", err)
 }
@@ -122,14 +94,31 @@ func (l *Lair) ListenAndServe(ctx context.Context) error {
 	return l.Serve(ctx, ln)
 }
 
-func (l *Lair) track(c net.Conn, on bool) {
+func (l *Lair) track(c net.Conn, busy bool) (*connMark, bool) {
 	l.mu.Lock()
-	if on {
-		l.conns[c] = struct{}{}
-	} else {
-		delete(l.conns, c)
+	defer l.mu.Unlock()
+	if l.closing {
+		return nil, false
 	}
+	m := &connMark{}
+	m.busy.Store(busy)
+	l.conns[c] = m
+	return m, true
+}
+
+func (l *Lair) untrack(c net.Conn) {
+	l.mu.Lock()
+	delete(l.conns, c)
 	l.mu.Unlock()
+}
+
+func (l *Lair) markOf(c net.Conn) *connMark {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if m := l.conns[c]; m != nil {
+		return m
+	}
+	return &connMark{}
 }
 
 func (l *Lair) Serve(ctx context.Context, ln net.Listener) error {
@@ -162,14 +151,33 @@ func (l *Lair) Serve(ctx context.Context, ln net.Listener) error {
 			_ = conn.Close()
 			continue
 		}
-		l.track(conn, true)
+		if _, ok := l.track(conn, false); !ok {
+			<-l.slots
+			_ = conn.Close()
+			continue
+		}
 		l.wg.Add(1)
 		go func() {
 			defer l.wg.Done()
-			defer l.track(conn, false)
+			defer l.untrack(conn)
 			defer func() { <-l.slots }()
 			l.handleConn(ctx, conn)
 		}()
+	}
+}
+
+const forceWait = 5 * time.Second
+
+func (l *Lair) closeConns(onlyIdle bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !onlyIdle {
+		l.closing = true
+	}
+	for c, m := range l.conns {
+		if !onlyIdle || !m.busy.Load() {
+			_ = c.Close()
+		}
 	}
 }
 
@@ -179,18 +187,19 @@ func (l *Lair) drainAll() {
 		l.wg.Wait()
 		close(done)
 	}()
+	l.closeConns(true)
 	select {
 	case <-done:
 		return
 	case <-time.After(l.cfg.ShutdownTimeout.D()):
 		l.logger.Warn("some sessions were still running when the shutdown wait ran out; closing them")
 	}
-	l.mu.Lock()
-	for c := range l.conns {
-		_ = c.Close()
+	l.closeConns(false)
+	select {
+	case <-done:
+	case <-time.After(forceWait):
+		l.logger.Error("some connections did not stop even after being closed; giving up on them and exiting")
 	}
-	l.mu.Unlock()
-	<-done
 }
 
 func (l *Lair) welcome(ctx context.Context, raw net.Conn) (*Tunnel, error) {
@@ -268,6 +277,7 @@ func (l *Lair) refuse(mc *Tunnel, err error) {
 
 func (l *Lair) handleConn(ctx context.Context, raw net.Conn) {
 	defer raw.Close()
+	mark := l.markOf(raw)
 	defer func() {
 		if r := recover(); r != nil {
 			l.logger.Error("handleConn panic", "remote", raw.RemoteAddr().String(), "err", r)
@@ -286,7 +296,8 @@ func (l *Lair) handleConn(ctx context.Context, raw net.Conn) {
 
 	for {
 		_ = raw.SetReadDeadline(time.Now().Add(l.cfg.IdleTimeout.D()))
-		again, err := l.serveOne(ctx, mc)
+		again, err := l.serveOne(ctx, mc, mark)
+		mark.busy.Store(false)
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, ErrNap) && ctx.Err() == nil {
 				l.logger.Debug("nakis request ended", "remote", raw.RemoteAddr().String(), "err", err)
@@ -306,10 +317,14 @@ func readN(mc *Tunnel, n int) ([]byte, error) {
 	return buf, err
 }
 
-func (l *Lair) serveOne(ctx context.Context, mc *Tunnel) (bool, error) {
+func (l *Lair) serveOne(ctx context.Context, mc *Tunnel, mark *connMark) (bool, error) {
 	version, err := mc.ReadByte()
 	if err != nil {
 		return false, err
+	}
+	mark.busy.Store(true)
+	if ctx.Err() != nil {
+		return false, ctx.Err()
 	}
 	if version != HelloVersion {
 		return false, fmt.Errorf("nakis: invalid protocol version 0x%x", version)
@@ -362,6 +377,10 @@ func (l *Lair) hug(ctx context.Context, mc *Tunnel, target string) bool {
 		return false
 	}
 	defer up.Close()
+	if _, ok := l.track(up, true); !ok {
+		return false
+	}
+	defer l.untrack(up)
 
 	_, port, _ := net.SplitHostPort(target)
 	return newNest(l, mc, up, tlsLike(port)).run()
@@ -377,13 +396,46 @@ func errnoOf(err error) byte {
 
 var errPrivate = errors.New("target address is private; set allow_private to permit it")
 
-func isPrivate(host string) bool {
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return false
+var blockedNets = func() []netip.Prefix {
+	var out []netip.Prefix
+	for _, s := range []string{
+		"0.0.0.0/8",
+		"fec0::/10",
+	} {
+		out = append(out, netip.MustParsePrefix(s))
 	}
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
+	return out
+}()
+
+var nat64 = netip.MustParsePrefix("64:ff9b::/96")
+
+func isPrivate(host string) bool {
+	if i := strings.IndexByte(host, '%'); i >= 0 {
+		host = host[:i]
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return true
+	}
+	return blockedAddr(addr)
+}
+
+func blockedAddr(addr netip.Addr) bool {
+	addr = addr.WithZone("").Unmap()
+	if addr.Is6() && nat64.Contains(addr) {
+		b := addr.As16()
+		addr = netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]})
+	}
+	if addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
+		addr.IsInterfaceLocalMulticast() || addr.IsUnspecified() || addr.IsMulticast() {
+		return true
+	}
+	for _, p := range blockedNets {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 const (
@@ -429,6 +481,9 @@ func (l *Lair) dialTarget(ctx context.Context, target string) (net.Conn, error) 
 	host, port, err := net.SplitHostPort(target)
 	if err != nil {
 		return nil, err
+	}
+	if strings.ContainsRune(host, '%') {
+		return nil, errors.New("target address must not carry a zone")
 	}
 	ips, err := l.addresses(ctx, host)
 	if err != nil {
