@@ -56,6 +56,73 @@ type Kitten struct {
 	cancel   context.CancelFunc
 	loop     sync.WaitGroup
 	sessions sync.WaitGroup
+
+	smu     sync.Mutex
+	active  map[*sessionRef]struct{}
+	closing bool
+}
+
+type sessionRef struct {
+	mu      sync.Mutex
+	app     net.Conn
+	cancel  context.CancelFunc
+	tunnel  *Tunnel
+	aborted bool
+}
+
+func (s *sessionRef) bind(mc *Tunnel) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.aborted {
+		return false
+	}
+	s.tunnel = mc
+	return true
+}
+
+func (s *sessionRef) abort() {
+	s.mu.Lock()
+	s.aborted = true
+	mc, cancel := s.tunnel, s.cancel
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	_ = s.app.Close()
+	if mc != nil {
+		_ = mc.Close()
+	}
+}
+
+func (k *Kitten) beginSession(app net.Conn) (*sessionRef, bool) {
+	k.smu.Lock()
+	defer k.smu.Unlock()
+	if k.closing {
+		return nil, false
+	}
+	ref := &sessionRef{app: app}
+	k.active[ref] = struct{}{}
+	k.sessions.Add(1)
+	return ref, true
+}
+
+func (k *Kitten) endSession(ref *sessionRef) {
+	k.smu.Lock()
+	delete(k.active, ref)
+	k.smu.Unlock()
+	k.sessions.Done()
+}
+
+func (k *Kitten) abortSessions() {
+	k.smu.Lock()
+	refs := make([]*sessionRef, 0, len(k.active))
+	for r := range k.active {
+		refs = append(refs, r)
+	}
+	k.smu.Unlock()
+	for _, r := range refs {
+		r.abort()
+	}
 }
 
 func NewKitten(cfg ClientConfig, logger *slog.Logger) (*Kitten, error) {
@@ -87,9 +154,10 @@ func NewKitten(cfg ClientConfig, logger *slog.Logger) (*Kitten, error) {
 		want:     cfg.PoolLo,
 		ctx:      ctx,
 		cancel:   cancel,
-		tuneFast: tuning{poolHi: cfg.PoolHi + 64, raceN: 10},
+		active:   map[*sessionRef]struct{}{},
+		tuneFast: tuning{poolHi: cfg.PoolHi, raceN: 10},
 		tuneMid:  tuning{poolHi: cfg.PoolHi, raceN: cfg.RaceCount},
-		tuneSlow: tuning{poolHi: cfg.PoolLo + 8, raceN: 3},
+		tuneSlow: tuning{poolHi: min(cfg.PoolLo+8, cfg.PoolHi), raceN: 3},
 	}
 	mid := k.tuneMid
 	k.tuneNow.Store(&mid)
@@ -208,7 +276,7 @@ func (k *Kitten) retune() {
 		poolHi: approach(cur.poolHi, goal.poolHi),
 		raceN:  approach(cur.raceN, goal.raceN),
 	}
-	next.poolHi = min(max(next.poolHi, k.cfg.PoolLo+4), max(k.cfg.PoolHi, 128))
+	next.poolHi = min(max(next.poolHi, min(k.cfg.PoolLo+4, k.cfg.PoolHi)), k.cfg.PoolHi)
 	next.raceN = min(max(next.raceN, 2), 12)
 	k.tuneNow.Store(&next)
 }
@@ -270,7 +338,7 @@ func (k *Kitten) topUp() {
 		k.mu.Unlock()
 		return
 	}
-	n := min(k.want-idle-k.flying, spawnCap-k.flying)
+	n := min(min(k.want, k.pool.maxSize)-idle-k.flying, spawnCap-k.flying)
 	if n <= 0 {
 		k.mu.Unlock()
 		return
@@ -301,7 +369,7 @@ func (k *Kitten) tick() {
 			k.calm = 0
 		}
 	}
-	k.want = min(max(k.want, k.cfg.PoolLo), k.tuneNow.Load().poolHi)
+	k.want = min(max(k.want, k.cfg.PoolLo), min(k.tuneNow.Load().poolHi, k.pool.maxSize))
 	k.miss = 0
 	now := k.want
 	k.mu.Unlock()
@@ -341,7 +409,12 @@ func (k *Kitten) Start() {
 	k.poke()
 }
 
+const abortWait = 3 * time.Second
+
 func (k *Kitten) Shutdown(timeout time.Duration) {
+	k.smu.Lock()
+	k.closing = true
+	k.smu.Unlock()
 	k.cancel()
 	done := make(chan struct{})
 	go func() {
@@ -353,6 +426,12 @@ func (k *Kitten) Shutdown(timeout time.Duration) {
 	case <-done:
 	case <-time.After(timeout):
 		k.logger.Warn("some sessions were still running when the shutdown wait ran out; closing them", "waited", timeout)
+		k.abortSessions()
+		select {
+		case <-done:
+		case <-time.After(abortWait):
+			k.logger.Error("some sessions did not stop even after being closed; giving up on them")
+		}
 	}
 	k.pool.closeAll()
 }
@@ -445,16 +524,29 @@ func (k *Kitten) ServeSOCKS5(ctx context.Context, listenAddr string) error {
 		if tc, ok := conn.(*net.TCPConn); ok {
 			_ = tc.SetKeepAlive(true)
 		}
-		k.sessions.Add(1)
+		ref, ok := k.beginSession(conn)
+		if !ok {
+			_ = conn.Close()
+			continue
+		}
 		go func() {
-			defer k.sessions.Done()
-			k.handleSocks(ctx, conn)
+			defer k.endSession(ref)
+			k.handleSocks(ctx, conn, ref)
 		}()
 	}
 }
 
-func (k *Kitten) handleSocks(ctx context.Context, app net.Conn) {
+func (k *Kitten) handleSocks(parent context.Context, app net.Conn, ref *sessionRef) {
 	defer app.Close()
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	ref.mu.Lock()
+	ref.cancel = cancel
+	aborted := ref.aborted
+	ref.mu.Unlock()
+	if aborted {
+		return
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			k.logger.Error("recovered from a crash while serving a SOCKS5 connection", "err", r)
@@ -477,7 +569,13 @@ func (k *Kitten) handleSocks(ctx context.Context, app net.Conn) {
 
 	pc, err := k.dialTCP(ctx, host, port)
 	if err != nil {
-		k.logger.Warn("couldn't reach "+target+" through the tunnel", "err", err)
+		if ctx.Err() == nil {
+			k.logger.Warn("couldn't reach "+target+" through the tunnel", "err", err)
+		}
+		return
+	}
+	if !ref.bind(pc.mc) {
+		_ = pc.mc.Close()
 		return
 	}
 	k.shuttle(app, pc, target)
