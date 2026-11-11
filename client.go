@@ -554,12 +554,24 @@ func (k *Kitten) handleSocks(parent context.Context, app net.Conn, ref *sessionR
 	}()
 
 	_ = app.SetDeadline(time.Now().Add(k.cfg.HandshakeTimeout.D()))
-	host, port, err := SocksGreet(app)
+	req, err := SocksRequest(app)
+	if err == nil && req.cmd == 1 {
+		if req.host == uotHost {
+			err = errProto
+		} else {
+			_, err = app.Write(replyOK)
+		}
+	}
 	_ = app.SetDeadline(time.Time{})
 	if err != nil {
 		k.logger.Debug("socks5 handshake failed", "remote", app.RemoteAddr().String(), "err", err)
 		return
 	}
+	if req.cmd == 3 {
+		k.handleUDP(ctx, app, ref, req)
+		return
+	}
+	host, port := req.host, req.port
 	target := net.JoinHostPort(host, strconv.Itoa(int(port)))
 	k.logger.Debug("nakis tcp", "remote", app.RemoteAddr().String(), "target", target)
 
@@ -961,10 +973,14 @@ type shuttleRun struct {
 	downDone atomic.Bool
 	appDead  atomic.Bool
 	wg       sync.WaitGroup
+
+	half time.Duration
+	dlMu sync.Mutex
+	stop bool
 }
 
 func (k *Kitten) shuttle(app net.Conn, pc *purrConn, target string) {
-	s := &shuttleRun{cli: k, app: app, pc: pc, target: target}
+	s := &shuttleRun{cli: k, app: app, pc: pc, target: target, half: k.cfg.HalfCloseTimeout.D()}
 	plan, pad, fill := k.flight(len(pc.first), pc.inner)
 	s.gate = NewGate(GateOptions{
 		Pack:  k.cfg.SendPack,
@@ -999,7 +1015,24 @@ func (s *shuttleRun) send(wire []byte, pad int) error {
 }
 
 func (s *shuttleRun) kickApp() {
+	s.dlMu.Lock()
+	s.stop = true
 	_ = s.app.SetReadDeadline(time.Now())
+	s.dlMu.Unlock()
+}
+
+func (s *shuttleRun) armApp() {
+	s.dlMu.Lock()
+	if !s.stop {
+		_ = s.app.SetReadDeadline(time.Now().Add(s.half))
+	}
+	s.dlMu.Unlock()
+}
+
+func (s *shuttleRun) armTunnel() {
+	if s.pc.napSent.Load() && !s.appDead.Load() {
+		_ = s.pc.mc.SetReadDeadline(time.Now().Add(s.half))
+	}
 }
 
 func (s *shuttleRun) deliver(p []byte) {
@@ -1009,6 +1042,9 @@ func (s *shuttleRun) deliver(p []byte) {
 	if _, err := s.app.Write(p); err != nil {
 		s.appDead.Store(true)
 		s.kickApp()
+		if s.pc.napSent.Load() {
+			_ = s.pc.mc.SetReadDeadline(time.Now().Add(s.cli.drainWindow()))
+		}
 		return
 	}
 }
@@ -1017,7 +1053,9 @@ func (s *shuttleRun) downstream() {
 	defer s.wg.Done()
 	defer func() {
 		s.downDone.Store(true)
-		s.kickApp()
+		if s.pc.broken.Load() {
+			s.kickApp()
+		}
 	}()
 	mc := s.pc.mc
 
@@ -1037,10 +1075,15 @@ func (s *shuttleRun) downstream() {
 		PutBuf(rest)
 	}
 	for {
+		s.armTunnel()
 		p, err := mc.ReadFrame()
 		if err != nil {
 			if errors.Is(err, ErrNap) {
 				s.pc.napSeen.Store(true)
+				if !s.appDead.Load() {
+					closeWrite(s.app)
+					s.armApp()
+				}
 			} else {
 				s.pc.broken.Store(true)
 			}
@@ -1058,6 +1101,9 @@ func (s *shuttleRun) upstream() {
 
 	s.gate.Feed(s.pc.first)
 	for {
+		if s.downDone.Load() {
+			s.armApp()
+		}
 		n, err := s.app.Read(buf)
 		if n > 0 {
 			s.gate.Feed(buf[:n])
@@ -1066,7 +1112,7 @@ func (s *shuttleRun) upstream() {
 			break
 		}
 	}
-	if s.downDone.Load() || s.pc.broken.Load() {
+	if s.pc.broken.Load() {
 		return
 	}
 	s.gate.Flush()
@@ -1078,7 +1124,11 @@ func (s *shuttleRun) upstream() {
 		s.pc.broken.Store(true)
 		return
 	}
-	_ = s.pc.mc.SetReadDeadline(time.Now().Add(s.cli.drainWindow()))
+	if s.appDead.Load() {
+		_ = s.pc.mc.SetReadDeadline(time.Now().Add(s.cli.drainWindow()))
+	} else {
+		_ = s.pc.mc.SetReadDeadline(time.Now().Add(s.half))
+	}
 }
 
 var (
@@ -1088,71 +1138,42 @@ var (
 	errProto    = errors.New("socks5: protocol error")
 )
 
-func SocksGreet(c net.Conn) (string, uint16, error) {
+func SocksRequest(c net.Conn) (socksReq, error) {
+	var r socksReq
 	var head [2]byte
 	if _, err := io.ReadFull(c, head[:]); err != nil {
-		return "", 0, err
+		return r, err
 	}
 	if head[0] != 5 {
-		return "", 0, errProto
+		return r, errProto
 	}
 	if _, err := io.CopyN(io.Discard, c, int64(head[1])); err != nil {
-		return "", 0, err
+		return r, err
 	}
 	if _, err := c.Write([]byte{5, 0}); err != nil {
-		return "", 0, err
+		return r, err
 	}
 
 	var req [4]byte
 	if _, err := io.ReadFull(c, req[:]); err != nil {
-		return "", 0, err
+		return r, err
 	}
 	if req[0] != 5 {
-		return "", 0, errProto
+		return r, errProto
 	}
-
-	var host string
 	switch req[3] {
-	case 1:
-		var ip [4]byte
-		if _, err := io.ReadFull(c, ip[:]); err != nil {
-			return "", 0, err
-		}
-		host = net.IP(ip[:]).String()
-	case 3:
-		var n [1]byte
-		if _, err := io.ReadFull(c, n[:]); err != nil {
-			return "", 0, err
-		}
-		if n[0] == 0 {
-			return "", 0, errProto
-		}
-		name := make([]byte, n[0])
-		if _, err := io.ReadFull(c, name); err != nil {
-			return "", 0, err
-		}
-		host = string(name)
-	case 4:
-		var ip [16]byte
-		if _, err := io.ReadFull(c, ip[:]); err != nil {
-			return "", 0, err
-		}
-		host = net.IP(ip[:]).String()
+	case 1, 3, 4:
 	default:
 		_, _ = c.Write(replyNoAddr)
-		return "", 0, fmt.Errorf("socks5: address type %d unsupported", req[3])
+		return r, fmt.Errorf("socks5: address type %d unsupported", req[3])
 	}
-
-	var pb [2]byte
-	if _, err := io.ReadFull(c, pb[:]); err != nil {
-		return "", 0, err
+	a, err := readAddr(c, req[3])
+	if err != nil {
+		return r, err
 	}
-	if req[1] != 1 {
+	if req[1] != 1 && req[1] != 3 {
 		_, _ = c.Write(replyNoCmd)
-		return "", 0, fmt.Errorf("socks5: command %d unsupported", req[1])
+		return r, fmt.Errorf("socks5: command %d unsupported", req[1])
 	}
-	if _, err := c.Write(replyOK); err != nil {
-		return "", 0, err
-	}
-	return host, uint16(pb[0])<<8 | uint16(pb[1]), nil
+	return socksReq{cmd: req[1], host: a.host, port: a.port}, nil
 }
