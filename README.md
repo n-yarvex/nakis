@@ -82,6 +82,6 @@ Nakis 是一个基于 go 开发的 SOCKS5 入口 + TLS 隧道的轻量代理协�
 | --- | --- | --- |
 | [**CONFIG.md**](doc/CONFIG.md) | enduser | 每个配置项的含义和作用 + 订阅格式（不再讲部署，部署交给一键脚本和客户端） |
 | [**SPEC.md**](doc/SPEC.md) | 其它开发者 / 客户端集成 | 协议规范+参考实现逐条核对 |
-| [**TESTING.md**](doc/TESTING.md) | ？ | 所有测试以及结果 |
+| [**协议图标**](doc/Nakis,win!.jpg) | ？ | 总有一天会赢的😖 |
 ---
 
