@@ -61,6 +61,8 @@ type ClientConfig struct {
 	SendQuiet        int      `json:"send_quiet"`
 	ShapeUp          [][2]int `json:"shape_up"`
 	ShapeWait        Span     `json:"shape_wait"`
+	HalfCloseTimeout Span     `json:"half_close_timeout"`
+	UDPJitter        Span     `json:"udp_jitter"`
 	TLS              bool     `json:"tls"`
 	SNI              string   `json:"sni"`
 	TLSPins          []string `json:"tls_pins"`
@@ -77,6 +79,10 @@ type ServerConfig struct {
 	HandshakeTimeout Span     `json:"handshake_timeout"`
 	IdleTimeout      Span     `json:"idle_timeout"`
 	ShutdownTimeout  Span     `json:"shutdown_timeout"`
+	HalfCloseTimeout Span     `json:"half_close_timeout"`
+	UDP              bool     `json:"udp"`
+	UDPIdleTimeout   Span     `json:"udp_idle_timeout"`
+	UDPJitter        Span     `json:"udp_jitter"`
 	Congestion       string   `json:"congestion"`
 	SendPack         int      `json:"send_pack"`
 	SendTail         int      `json:"send_tail"`
@@ -109,6 +115,8 @@ func DefaultClient() ClientConfig {
 		SendTail:         512,
 		SendQuiet:        4,
 		ShapeWait:        Span(20 * time.Millisecond),
+		HalfCloseTimeout: Span(120 * time.Second),
+		UDPJitter:        Span(8 * time.Millisecond),
 		TLS:              true,
 	}
 }
@@ -120,6 +128,10 @@ func DefaultServer() ServerConfig {
 		HandshakeTimeout: Span(10 * time.Second),
 		IdleTimeout:      Span(120 * time.Second),
 		ShutdownTimeout:  Span(20 * time.Second),
+		HalfCloseTimeout: Span(120 * time.Second),
+		UDP:              true,
+		UDPIdleTimeout:   Span(300 * time.Second),
+		UDPJitter:        Span(8 * time.Millisecond),
 		Keepalive:        Span(15 * time.Second),
 		LogLevel:         "info",
 		MaxConns:         4096,
@@ -298,7 +310,15 @@ func (c *ClientConfig) Tidy() error {
 	positive(&c.PoolMaxAge, 15*time.Second)
 	positive(&c.Keepalive, 15*time.Second)
 	positive(&c.ShapeWait, 20*time.Millisecond)
+	positive(&c.HalfCloseTimeout, 120*time.Second)
+	c.UDPJitter = jitterSpan(c.UDPJitter)
 	return nil
+}
+
+const jitterCap = 200 * time.Millisecond
+
+func jitterSpan(s Span) Span {
+	return Span(min(max(s.D(), 0), jitterCap))
 }
 
 func checkShape(plan [][2]int) error {
@@ -339,6 +359,9 @@ func (s *ServerConfig) Tidy() error {
 	positive(&s.HandshakeTimeout, 10*time.Second)
 	positive(&s.IdleTimeout, 120*time.Second)
 	positive(&s.ShutdownTimeout, 20*time.Second)
+	positive(&s.HalfCloseTimeout, 120*time.Second)
+	positive(&s.UDPIdleTimeout, 300*time.Second)
+	s.UDPJitter = jitterSpan(s.UDPJitter)
 	positive(&s.Keepalive, 15*time.Second)
 	s.MaxConns = clamp(s.MaxConns, 1, 1<<20)
 	return nil
