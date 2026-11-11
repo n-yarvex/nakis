@@ -201,6 +201,12 @@ func (c *Tunnel) Moved() int64 { return c.moved.Load() }
 
 var longAgo = time.Unix(1, 0)
 
+func closeWrite(c net.Conn) {
+	if cw, ok := c.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
+}
+
 func (c *Tunnel) Dirty() bool {
 	c.rMu.Lock()
 	defer c.rMu.Unlock()
