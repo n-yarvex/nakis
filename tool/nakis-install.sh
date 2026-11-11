@@ -32,6 +32,8 @@
 #   NAKIS_DNS=1.1.1.1,8.8.8.8  NAKIS_ALLOW_PRIVATE=true|false  NAKIS_MAX_CONNS=4096
 #   NAKIS_KEEPALIVE=15s  NAKIS_CONGESTION=bbr  NAKIS_LOG_LEVEL=info|debug|warn|error
 #   NAKIS_DIAL_TIMEOUT NAKIS_HANDSHAKE_TIMEOUT NAKIS_IDLE_TIMEOUT NAKIS_SHUTDOWN_TIMEOUT
+#   NAKIS_HALF_CLOSE_TIMEOUT=2m  半关闭后另一个方向最多空闲多久（超过就收尾）
+#   NAKIS_UDP=true|false  是否承载 UDP（UoT）   NAKIS_UDP_IDLE_TIMEOUT=5m  NAKIS_UDP_JITTER=8ms
 #   NAKIS_SEND_PACK NAKIS_SEND_TAIL NAKIS_SEND_QUIET NAKIS_MERGE_PACK NAKIS_MAX_QUEUE
 # 其他：
 #   NAKIS_YES=1          不提问，全部用环境变量 / 当前值 / 默认值
@@ -129,7 +131,8 @@ validate() {
 
 KEYS=(HOSTS PORT PUBLIC_PORT BIND UUID NODE_NAME TLS_MODE CERT_SRC KEY_SRC SNI ECH ECH_PUBLIC
       DNS ALLOW_PRIVATE MAX_CONNS KEEPALIVE CONGESTION LOG_LEVEL
-      DIAL_TIMEOUT HANDSHAKE_TIMEOUT IDLE_TIMEOUT SHUTDOWN_TIMEOUT
+      DIAL_TIMEOUT HANDSHAKE_TIMEOUT IDLE_TIMEOUT SHUTDOWN_TIMEOUT HALF_CLOSE_TIMEOUT
+      UDP UDP_IDLE_TIMEOUT UDP_JITTER
       SEND_PACK SEND_TAIL SEND_QUIET MERGE_PACK MAX_QUEUE)
 
 set_defaults() {
@@ -137,6 +140,7 @@ set_defaults() {
   TLS_MODE=self; CERT_SRC=; KEY_SRC=; SNI=; ECH=0; ECH_PUBLIC=cloudflare-ech.com
   DNS=; ALLOW_PRIVATE=false; MAX_CONNS=4096; KEEPALIVE=15s; CONGESTION=; LOG_LEVEL=info
   DIAL_TIMEOUT=5s; HANDSHAKE_TIMEOUT=10s; IDLE_TIMEOUT=120s; SHUTDOWN_TIMEOUT=20s
+  HALF_CLOSE_TIMEOUT=120s; UDP=true; UDP_IDLE_TIMEOUT=300s; UDP_JITTER=8ms
   SEND_PACK=32768; SEND_TAIL=512; SEND_QUIET=4; MERGE_PACK=20480; MAX_QUEUE=4194304
 }
 
@@ -144,8 +148,8 @@ kind_of() {
   case "$1" in
     HOSTS) echo hosts ;; PORT|PUBLIC_PORT) echo port ;; BIND) echo bind ;; UUID) echo uuid ;;
     NODE_NAME) echo name ;; TLS_MODE) echo tls ;; CERT_SRC|KEY_SRC) echo file ;; SNI|ECH_PUBLIC) echo host ;;
-    ECH) echo bit ;; DNS) echo dns ;; ALLOW_PRIVATE) echo bool ;; MAX_CONNS) echo int:1:1048576 ;;
-    KEEPALIVE|DIAL_TIMEOUT|HANDSHAKE_TIMEOUT|IDLE_TIMEOUT|SHUTDOWN_TIMEOUT) echo dur ;;
+    ECH) echo bit ;; DNS) echo dns ;; ALLOW_PRIVATE|UDP) echo bool ;; MAX_CONNS) echo int:1:1048576 ;;
+    KEEPALIVE|DIAL_TIMEOUT|HANDSHAKE_TIMEOUT|IDLE_TIMEOUT|SHUTDOWN_TIMEOUT|HALF_CLOSE_TIMEOUT|UDP_IDLE_TIMEOUT|UDP_JITTER) echo dur ;;
     CONGESTION) echo cc ;; LOG_LEVEL) echo level ;;
     SEND_PACK) echo int:1024:65533 ;; SEND_TAIL) echo int:0:65532 ;; SEND_QUIET) echo int:0:64 ;;
     MERGE_PACK) echo int:1024:65533 ;; MAX_QUEUE) echo int:65536:268435456 ;;
@@ -505,6 +509,10 @@ render_server_json() {
     echo "  \"handshake_timeout\": \"$HANDSHAKE_TIMEOUT\","
     echo "  \"idle_timeout\": \"$IDLE_TIMEOUT\","
     echo "  \"shutdown_timeout\": \"$SHUTDOWN_TIMEOUT\","
+    echo "  \"half_close_timeout\": \"$HALF_CLOSE_TIMEOUT\","
+    echo "  \"udp\": $UDP,"
+    echo "  \"udp_idle_timeout\": \"$UDP_IDLE_TIMEOUT\","
+    echo "  \"udp_jitter\": \"$UDP_JITTER\","
     echo "  \"send_pack\": $SEND_PACK,"
     echo "  \"send_tail\": $SEND_TAIL,"
     echo "  \"send_quiet\": $SEND_QUIET,"
@@ -644,6 +652,10 @@ wizard() {
   prompt HANDSHAKE_TIMEOUT "握手超时（等客户端发认证的最长时间）" "" adv
   prompt IDLE_TIMEOUT "空闲超时" "" adv
   prompt SHUTDOWN_TIMEOUT "停止服务时等待现有连接收尾的最长时间" "" adv
+  prompt HALF_CLOSE_TIMEOUT "半关闭（一端已发完）后，另一个方向最多空闲多久就收尾" "" adv
+  prompt UDP "是否承载 UDP（语音通话 / QUIC / 游戏等，走 UoT；false = 只跑 TCP）" "" adv
+  prompt UDP_IDLE_TIMEOUT "UDP 关联多久没有任何数据就回收" "" adv
+  prompt UDP_JITTER "UDP 回程的时序扰动上限（如 8ms；0s = 不扰动）" "" adv
   prompt SEND_PACK "下行合包上限（字节）" "" adv
   prompt SEND_TAIL "合包尾部阈值（字节）" "" adv
   prompt SEND_QUIET "合包安静延长轮数" "" adv
