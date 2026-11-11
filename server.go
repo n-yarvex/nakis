@@ -363,6 +363,9 @@ func (l *Lair) serveOne(ctx context.Context, mc *Tunnel, mark *connMark) (bool, 
 	}
 	_ = mc.SetReadDeadline(time.Time{})
 
+	if string(host) == uotHost {
+		return l.uot(ctx, mc), nil
+	}
 	target := net.JoinHostPort(string(host), strconv.Itoa(int(binary.BigEndian.Uint16(pb))))
 	return l.hug(ctx, mc, target), nil
 }
@@ -555,9 +558,11 @@ type nest struct {
 	greeted bool
 
 	napSeen      atomic.Bool
+	napSent      atomic.Bool
 	broken       atomic.Bool
 	feedWG       sync.WaitGroup
 	gatherFinish chan struct{}
+	half         time.Duration
 }
 
 func newNest(srv *Lair, tun *Tunnel, target net.Conn, inner bool) *nest {
@@ -568,6 +573,7 @@ func newNest(srv *Lair, tun *Tunnel, target net.Conn, inner bool) *nest {
 		target:       target,
 		box:          NewBox(cfg.MergePack, 0),
 		gatherFinish: make(chan struct{}),
+		half:         cfg.HalfCloseTimeout.D(),
 	}
 	n.cond = sync.NewCond(&n.mu)
 	n.gate = NewGate(GateOptions{
@@ -642,10 +648,14 @@ func (n *nest) deposit(p []byte) bool {
 func (n *nest) gather() {
 	defer close(n.gatherFinish)
 	for {
+		if n.napSent.Load() {
+			_ = n.tun.SetReadDeadline(time.Now().Add(n.half))
+		}
 		p, err := n.tun.ReadFrame()
 		if err != nil {
 			if errors.Is(err, ErrNap) {
 				n.napSeen.Store(true)
+				_ = n.target.SetReadDeadline(time.Now().Add(n.half))
 			} else {
 				n.broken.Store(true)
 			}
@@ -674,7 +684,11 @@ func (n *nest) feed() {
 		}
 		if n.box.Empty() {
 			n.mu.Unlock()
-			n.stop()
+			if n.broken.Load() {
+				n.stop()
+			} else {
+				closeWrite(n.target)
+			}
 			return
 		}
 		d, merged := n.box.Bundle(nil)
@@ -693,7 +707,7 @@ func (n *nest) feed() {
 	}
 }
 
-func (n *nest) mill() {
+func (n *nest) mill() (clean bool) {
 	wire := GetBuf(Headroom + PackCap)
 	defer PutBuf(wire)
 	half := PackCap >> 1
@@ -703,6 +717,9 @@ func (n *nest) mill() {
 	}()
 
 	for {
+		if n.napSeen.Load() {
+			_ = n.target.SetReadDeadline(time.Now().Add(n.half))
+		}
 		k, err := n.target.Read(wire[Headroom:])
 		if k > 0 {
 			if k >= half {
@@ -718,10 +735,13 @@ func (n *nest) mill() {
 			}
 		}
 		if err != nil {
-			if !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.EOF) {
+			if errors.Is(err, io.EOF) {
+				return !n.broken.Load()
+			}
+			if !errors.Is(err, net.ErrClosed) {
 				n.srv.logger.Debug("target read ended", "err", err)
 			}
-			return
+			return false
 		}
 	}
 }
@@ -734,18 +754,43 @@ func (n *nest) run() bool {
 	go n.feed()
 	go n.gather()
 
-	n.mill()
-	n.stop()
+	if !n.mill() {
+		n.stop()
+		n.feedWG.Wait()
+		n.dispose()
+		if n.broken.Load() || n.sendNap() != nil {
+			return false
+		}
+		n.napSent.Store(true)
+		_ = n.tun.SetReadDeadline(time.Now().Add(serverDrain))
+		<-n.gatherFinish
+		return n.finish()
+	}
+
+	if n.sendNap() != nil {
+		n.stop()
+		n.feedWG.Wait()
+		n.dispose()
+		return false
+	}
+	n.napSent.Store(true)
+	_ = n.tun.SetReadDeadline(time.Now().Add(n.half))
+	<-n.gatherFinish
+	guard := time.AfterFunc(n.half, n.stop)
 	n.feedWG.Wait()
+	guard.Stop()
+	n.stop()
+	n.dispose()
+	return n.finish()
+}
+
+func (n *nest) dispose() {
 	n.mu.Lock()
 	n.box.Dispose()
 	n.mu.Unlock()
+}
 
-	if n.broken.Load() || n.sendNap() != nil {
-		return false
-	}
-	_ = n.tun.SetReadDeadline(time.Now().Add(serverDrain))
-	<-n.gatherFinish
+func (n *nest) finish() bool {
 	if n.broken.Load() || !n.napSeen.Load() {
 		return false
 	}
