@@ -24,12 +24,12 @@ const (
 	udpBatchMax = 32 << 10
 	udpDestCap  = 4096
 	udpNameCap  = 256
-	udpFirstPad = 400
+	udpPadMax   = 400
 	udpTick     = 10 * time.Second
-	udpStrikes  = 50
+	udpGiveUp   = 50
 )
 
-var errBadRecord = errors.New("nakis: malformed udp record")
+var errMangled = errors.New("nakis: malformed udp record")
 
 type udpAddr struct {
 	host string
@@ -50,7 +50,7 @@ func (a udpAddr) appendTo(b []byte) ([]byte, error) {
 		}
 	} else {
 		if len(a.host) == 0 || len(a.host) > 255 {
-			return nil, errBadRecord
+			return nil, errMangled
 		}
 		b = append(b, 3, byte(len(a.host)))
 		b = append(b, a.host...)
@@ -74,7 +74,7 @@ func readAddr(r io.Reader, atyp byte) (udpAddr, error) {
 			return a, err
 		}
 		if n[0] == 0 {
-			return a, errBadRecord
+			return a, errMangled
 		}
 		name := make([]byte, n[0])
 		if _, err := io.ReadFull(r, name); err != nil {
@@ -82,7 +82,7 @@ func readAddr(r io.Reader, atyp byte) (udpAddr, error) {
 		}
 		a.host = string(name)
 	default:
-		return a, errBadRecord
+		return a, errMangled
 	}
 	var pb [2]byte
 	if _, err := io.ReadFull(r, pb[:]); err != nil {
@@ -94,7 +94,7 @@ func readAddr(r io.Reader, atyp byte) (udpAddr, error) {
 
 func appendRecord(b []byte, a udpAddr, data []byte) ([]byte, error) {
 	if len(data) > 0xFFFF {
-		return nil, errBadRecord
+		return nil, errMangled
 	}
 	b, err := a.appendTo(b)
 	if err != nil {
@@ -126,7 +126,7 @@ func readRecord(r *bufio.Reader, buf []byte) (udpAddr, []byte, error) {
 
 func midRecord(err error) error {
 	if errors.Is(err, ErrNap) || errors.Is(err, io.EOF) {
-		return fmt.Errorf("%w: cut short", errBadRecord)
+		return fmt.Errorf("%w: cut short", errMangled)
 	}
 	return err
 }
@@ -156,11 +156,11 @@ func randBelow(n int) int {
 	return int(v.Int64())
 }
 
-func sendPadded(mc *Tunnel, payload []byte) error {
+func sendWithPad(mc *Tunnel, payload []byte) error {
 	wire := GetBuf(Headroom + len(payload))
 	defer PutBuf(wire)
 	copy(wire[Headroom:], payload)
-	return mc.SendWirePad(wire, 4+randBelow(udpFirstPad))
+	return mc.SendWirePad(wire, 4+randBelow(udpPadMax))
 }
 
 type jitterMux struct {
@@ -299,7 +299,7 @@ func (l *Lair) uot(ctx context.Context, mc *Tunnel) bool {
 		return false
 	}
 	defer pc.Close()
-	if sendPadded(mc, CozyByte) != nil {
+	if sendWithPad(mc, CozyByte) != nil {
 		return false
 	}
 	s := &uotServe{l: l, mc: mc, pc: pc, sent: map[netip.Addr]time.Time{}, names: map[string]netip.Addr{}}
@@ -387,6 +387,9 @@ func (s *uotServe) resolve(ctx context.Context, host string) (netip.Addr, bool) 
 			continue
 		}
 		ip = ip.WithZone("").Unmap()
+		if !s.l.cfg.AllowPrivate && blockedAddr(ip) {
+			continue
+		}
 		if !pick.IsValid() || (ip.Is4() && !pick.Is4()) {
 			pick = ip
 		}
@@ -455,7 +458,7 @@ func (s *uotServe) pump() {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
-			if strikes++; strikes >= udpStrikes {
+			if strikes++; strikes >= udpGiveUp {
 				s.l.logger.Debug("udp socket keeps failing, closing the association", "err", err)
 				_ = s.mc.Close()
 				return
@@ -541,7 +544,7 @@ func (k *Kitten) handleUDP(ctx context.Context, app net.Conn, ref *sessionRef, r
 		_ = pc.mc.Close()
 		return
 	}
-	if err := sendPadded(pc.mc, pc.first); err != nil {
+	if err := sendWithPad(pc.mc, pc.first); err != nil {
 		pc.broken.Store(true)
 		pc.release()
 		_, _ = app.Write(replyFail)
@@ -620,7 +623,7 @@ func (a *udpAssoc) up() {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
-			if strikes++; strikes >= udpStrikes {
+			if strikes++; strikes >= udpGiveUp {
 				return
 			}
 			time.Sleep(10 * time.Millisecond)
