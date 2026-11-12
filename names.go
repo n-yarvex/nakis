@@ -111,24 +111,31 @@ func (c *NameCache) Resolve(ctx context.Context, host string) ([]string, error) 
 	if net.ParseIP(host) != nil {
 		return []string{host}, nil
 	}
-	c.mu.Lock()
-	if e, ok := c.held[host]; ok && time.Now().Before(e.exp) {
-		c.mu.Unlock()
-		return e.ips, e.err
-	}
-	if f, ok := c.flying[host]; ok {
-		c.mu.Unlock()
-		select {
-		case <-f.done:
-			return f.ips, f.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
+	var f *dnsCall
+	var stale dnsEntry
+	for f == nil {
+		c.mu.Lock()
+		if e, ok := c.held[host]; ok && time.Now().Before(e.exp) {
+			c.mu.Unlock()
+			return e.ips, e.err
 		}
+		if other, ok := c.flying[host]; ok {
+			c.mu.Unlock()
+			select {
+			case <-other.done:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			if other.err != nil && (errors.Is(other.err, context.Canceled) || errors.Is(other.err, context.DeadlineExceeded)) && ctx.Err() == nil {
+				continue
+			}
+			return other.ips, other.err
+		}
+		f = &dnsCall{done: make(chan struct{})}
+		c.flying[host] = f
+		stale = c.held[host]
+		c.mu.Unlock()
 	}
-	f := &dnsCall{done: make(chan struct{})}
-	c.flying[host] = f
-	stale := c.held[host]
-	c.mu.Unlock()
 
 	addrs, err := c.lookup(ctx, host)
 	if err == nil && len(addrs) == 0 {
