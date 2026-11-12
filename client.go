@@ -1030,9 +1030,16 @@ func (s *shuttleRun) armApp() {
 }
 
 func (s *shuttleRun) armTunnel() {
-	if s.pc.napSent.Load() && !s.appDead.Load() {
-		_ = s.pc.mc.SetReadDeadline(time.Now().Add(s.half))
+	if !s.pc.napSent.Load() {
+		return
 	}
+	s.dlMu.Lock()
+	defer s.dlMu.Unlock()
+	if s.appDead.Load() {
+		_ = s.pc.mc.SetReadDeadline(time.Now().Add(s.cli.drainWindow()))
+		return
+	}
+	_ = s.pc.mc.SetReadDeadline(time.Now().Add(s.half))
 }
 
 func (s *shuttleRun) deliver(p []byte) {
@@ -1040,11 +1047,11 @@ func (s *shuttleRun) deliver(p []byte) {
 		return
 	}
 	if _, err := s.app.Write(p); err != nil {
+		s.dlMu.Lock()
 		s.appDead.Store(true)
+		s.dlMu.Unlock()
 		s.kickApp()
-		if s.pc.napSent.Load() {
-			_ = s.pc.mc.SetReadDeadline(time.Now().Add(s.cli.drainWindow()))
-		}
+		s.armTunnel()
 		return
 	}
 }
@@ -1124,11 +1131,7 @@ func (s *shuttleRun) upstream() {
 		s.pc.broken.Store(true)
 		return
 	}
-	if s.appDead.Load() {
-		_ = s.pc.mc.SetReadDeadline(time.Now().Add(s.cli.drainWindow()))
-	} else {
-		_ = s.pc.mc.SetReadDeadline(time.Now().Add(s.half))
-	}
+	s.armTunnel()
 }
 
 var (
