@@ -6,6 +6,8 @@
 
 > **singbox模块 →** [sing-nakis](https://github.com/n-yarvex/sing-nakis)
 
+> **已知特征 →** [nakis-killer](https://github.com/n-yarvex/nakis-killer)
+
 ---
 
 ### 🧺 合包机制（前无古人 零碎的小写入会被攒成大帧再发）
