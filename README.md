@@ -1,7 +1,7 @@
 # Nakis 🍓
 
 > **小窝在这里 →** [Telegram](https://t.me/nakis_proxy)
-Nakis 是一个基于 go 开发的 SOCKS5 入口 + TLS 隧道的轻量代理协议（！），抗DPI协议（？），加速器（？）
+> **首个支持Nakis协议的客户端 →** [Sakurabox](https://github.com/xingmingname/SakuraBoxForAndroid/releases/tag/v1.0.3-beta.2)
 
 ---
 
