@@ -4,6 +4,8 @@
 
 > **首个支持Nakis协议的客户端 →** [Sakurabox](https://github.com/xingmingname/SakuraBoxForAndroid/releases/tag/v1.0.3-beta.2)
 
+> **singbox模块 →** [sing-nakis](https://github.com/n-yarvex/sing-nakis)
+
 ---
 
 ### 🧺 合包机制（前无古人 零碎的小写入会被攒成大帧再发）
