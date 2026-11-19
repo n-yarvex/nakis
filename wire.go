@@ -401,11 +401,28 @@ func (c *Tunnel) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+const (
+	napPadMin = 32
+	napPadMax = 400
+)
+
+func napPadLen() int {
+	var r [2]byte
+	_, _ = rand.Read(r[:])
+	return napPadMin + int(binary.BigEndian.Uint16(r[:]))%(napPadMax-napPadMin+1)
+}
+
 func (c *Tunnel) Nap() error {
+	pad := napPadLen()
+	out := GetBuf(pad + 2)
+	defer PutBuf(out)
+	binary.BigEndian.PutUint16(out, padMark)
+	binary.BigEndian.PutUint16(out[2:], uint16(pad-4))
+	_, _ = rand.Read(out[4:pad])
+	out[pad], out[pad+1] = 0, 0
 	c.wMu.Lock()
 	defer c.wMu.Unlock()
-	var zero [2]byte
-	return c.put(zero[:])
+	return c.put(out[:pad+2])
 }
 
 func (c *Tunnel) ReadReply() error {
