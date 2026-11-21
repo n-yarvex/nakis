@@ -295,7 +295,7 @@ func (l *Lair) uot(ctx context.Context, mc *Tunnel) bool {
 	pc, err := net.ListenPacket("udp", ":0")
 	if err != nil {
 		l.logger.Warn("couldn't open a udp socket for a client", "err", err)
-		_ = mc.Send(nil, OopsBytes(errnoOf(err), err.Error()))
+		_ = mc.Send(nil, OopsBytes(errnoOf(err), "udp socket failed"))
 		return false
 	}
 	defer pc.Close()
