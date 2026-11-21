@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -10,7 +9,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"net/http"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -129,17 +127,27 @@ func (l *Lair) Serve(ctx context.Context, ln net.Listener) error {
 	}()
 	defer l.drainAll()
 
+	var pause acceptPause
+	var lastWarn time.Time
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				continue
+			if !pause.wait(ctx, err) {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return err
 			}
-			return err
+			if time.Since(lastWarn) > 10*time.Second {
+				lastWarn = time.Now()
+				l.logger.Warn("accept is failing, will keep trying with a growing pause", "err", err)
+			}
+			continue
 		}
+		pause.reset()
 		if tc, ok := conn.(*net.TCPConn); ok {
 			_ = tc.SetKeepAlive(true)
 			_ = tc.SetKeepAlivePeriod(l.cfg.Keepalive.D())
@@ -227,25 +235,25 @@ func (l *Lair) welcome(ctx context.Context, raw net.Conn) (*Tunnel, error) {
 var errTurnedAway = errors.New("turned away")
 
 func (l *Lair) admit(mc *Tunnel) error {
-	frame, prefix, err := mc.ReadFirst(l.cfg.IdleTimeout.D(), min(l.cfg.HandshakeTimeout.D(), firstBody))
+	frame, _, err := mc.ReadFirst(l.cfg.IdleTimeout.D(), min(l.cfg.HandshakeTimeout.D(), firstBody))
 	if err != nil {
 		return err
 	}
 	if frame == nil {
 		l.refuse(mc, errors.New("not a nakis frame"))
-		l.decoy(mc, prefix)
+		l.quietClose(mc)
 		return errTurnedAway
 	}
+	var verdict error
 	if len(frame) < ProofSize {
-		PutBuf(frame)
-		l.refuse(mc, ErrBadMac)
-		l.decoy(mc, nil)
-		return errTurnedAway
+		verdict = ErrBadMac
+	} else {
+		verdict = l.guard.Accept(frame[:ProofSize], mc.bind)
 	}
-	if err := l.guard.Accept(frame[:ProofSize], mc.bind); err != nil {
+	if verdict != nil {
 		PutBuf(frame)
-		l.refuse(mc, err)
-		l.decoy(mc, nil)
+		l.refuse(mc, verdict)
+		l.quietClose(mc)
 		return errTurnedAway
 	}
 	if len(frame) == ProofSize {
@@ -375,8 +383,9 @@ func (l *Lair) hug(ctx context.Context, mc *Tunnel, target string) bool {
 
 	up, err := l.dialTarget(ctx, target)
 	if err != nil {
-		l.logger.Warn("couldn't connect to "+target+" for a client", "err", err)
-		_ = mc.Send(nil, OopsBytes(errnoOf(err), err.Error()))
+		l.logger.Warn("couldn't connect to a target for a client", "reason", oopsText(err))
+		l.logger.Debug("target connect failed", "target", target, "err", err)
+		_ = mc.Send(nil, OopsBytes(errnoOf(err), oopsText(err)))
 		return false
 	}
 	defer up.Close()
@@ -387,6 +396,32 @@ func (l *Lair) hug(ctx context.Context, mc *Tunnel, target string) bool {
 
 	_, port, _ := net.SplitHostPort(target)
 	return newNest(l, mc, up, tlsLike(port)).run()
+}
+
+func oopsText(err error) string {
+	var dns *net.DNSError
+	var errno syscall.Errno
+	var ne net.Error
+	switch {
+	case errors.Is(err, errPrivate):
+		return "target not allowed"
+	case errors.As(err, &dns) && dns.IsNotFound:
+		return "name not found"
+	case errors.As(err, &dns):
+		return "name lookup failed"
+	case errors.As(err, &errno):
+		switch errno {
+		case syscall.ECONNREFUSED:
+			return "connection refused"
+		case syscall.ENETUNREACH, syscall.EHOSTUNREACH:
+			return "unreachable"
+		case syscall.ETIMEDOUT:
+			return "timed out"
+		}
+	case errors.As(err, &ne) && ne.Timeout(), errors.Is(err, context.DeadlineExceeded):
+		return "timed out"
+	}
+	return "connect failed"
 }
 
 func errnoOf(err error) byte {
@@ -800,54 +835,11 @@ func (n *nest) finish() bool {
 
 const (
 	firstBody = 3 * time.Second
-	decoyWait = time.Second
-	decoyHead = 4096
+	drainWait = time.Second
+	drainMax  = 4096
 )
 
-var httpMethods = []string{"GET ", "HEAD ", "POST ", "PUT ", "DELETE ", "OPTIONS ", "PATCH ", "CONNECT ", "TRACE ", "PRI "}
-
-const decoyWelcome = "<!DOCTYPE html>\n<html>\n<head>\n<title>Welcome to nginx!</title>\n<style>\nhtml { color-scheme: light dark; }\nbody { width: 35em; margin: 0 auto;\nfont-family: Tahoma, Verdana, Arial, sans-serif; }\n</style>\n</head>\n<body>\n<h1>Welcome to nginx!</h1>\n<p>If you see this page, the nginx web server is successfully installed and\nworking. Further configuration is required.</p>\n\n<p>For online documentation and support please refer to\n<a href=\"http://nginx.org/\">nginx.org</a>.<br/>\nCommercial support is available at\n<a href=\"http://nginx.com/\">nginx.com</a>.</p>\n\n<p><em>Thank you for using nginx.</em></p>\n</body>\n</html>\n"
-
-func errorPage(code int, text string) string {
-	return fmt.Sprintf("<html>\r\n<head><title>%d %s</title></head>\r\n<body>\r\n<center><h1>%d %s</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n", code, text, code, text)
-}
-
-func decoyReply(head []byte) []byte {
-	line := string(head)
-	if i := strings.Index(line, "\r\n"); i >= 0 {
-		line = line[:i]
-	}
-	status, text, body, isHead := 400, "Bad Request", errorPage(400, "Bad Request"), false
-	for _, m := range httpMethods {
-		if strings.HasPrefix(line, m) {
-			isHead = m == "HEAD "
-			if strings.HasPrefix(line[len(m):], "/ ") || strings.HasPrefix(line[len(m):], "/index.html ") {
-				status, text, body = 200, "OK", decoyWelcome
-			} else {
-				status, text, body = 404, "Not Found", errorPage(404, "Not Found")
-			}
-			break
-		}
-	}
-	var out bytes.Buffer
-	fmt.Fprintf(&out, "HTTP/1.1 %d %s\r\nServer: nginx\r\nDate: %s\r\nContent-Type: text/html\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
-		status, text, time.Now().UTC().Format(http.TimeFormat), len(body))
-	if !isHead {
-		out.WriteString(body)
-	}
-	return out.Bytes()
-}
-
-func (l *Lair) decoy(mc *Tunnel, prefix []byte) {
-	_ = mc.Conn.SetDeadline(time.Now().Add(decoyWait))
-	head := append([]byte(nil), prefix...)
-	buf := make([]byte, 1024)
-	for len(head) < decoyHead && !bytes.Contains(head, []byte("\r\n\r\n")) {
-		n, err := mc.rd.Read(buf)
-		head = append(head, buf[:n]...)
-		if err != nil {
-			break
-		}
-	}
-	_, _ = mc.Conn.Write(decoyReply(head))
+func (l *Lair) quietClose(mc *Tunnel) {
+	_ = mc.Conn.SetReadDeadline(time.Now().Add(drainWait))
+	_, _ = io.CopyN(io.Discard, mc.rd, drainMax)
 }
