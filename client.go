@@ -510,17 +510,22 @@ func (k *Kitten) ServeSOCKS5(ctx context.Context, listenAddr string) error {
 		_ = ln.Close()
 	}()
 
+	var pause acceptPause
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				continue
+			if !pause.wait(ctx, err) {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return err
 			}
-			return err
+			continue
 		}
+		pause.reset()
 		if tc, ok := conn.(*net.TCPConn); ok {
 			_ = tc.SetKeepAlive(true)
 		}
