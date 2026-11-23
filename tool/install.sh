@@ -5,7 +5,12 @@
 #        bash install.sh help
 set -euo pipefail
 
-REPO="${NQ_REPO:-n-yarvex/nakis}"           # 二进制发布在哪个 GitHub 仓库的 Releases
+REPO="${NQ_REPO:-n-yarvex/nakis}"           # GitHub 仓库 (Releases 和源码都从这里取)
+BRANCH="${NQ_BRANCH:-main}"
+GH_PROXY="${NQ_GH_PROXY:-}"                 # 访问 GitHub 慢时可填加速前缀，例如 https://ghfast.top/
+SRC_DIR="${NQ_SRC:-/opt/nakis-quic-src}"    # 源码克隆到哪
+GO_DIR="${NQ_GO_DIR:-/opt/nakis-go}"        # 自己装的 Go 放哪 (不动系统的 Go)
+GO_WANT="${NQ_GO_VERSION:-1.25.5}"
 BIN="${NQ_BIN:-/usr/local/bin/nakis-quic}"
 CONF="${NQ_CONF:-/etc/nakis-quic}"
 UNIT="${NQ_UNIT:-/etc/systemd/system/nakis-quic.service}"
@@ -13,7 +18,14 @@ SYSCTL="${NQ_SYSCTL:-/etc/sysctl.d/99-nakis-quic.conf}"
 SVC_USER="nakisq"
 NO_TUNE=0; NO_FW=0; YES=0; TMP=""
 trap '[ -z "$TMP" ] || rm -f "$TMP"' EXIT
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF="${BASH_SOURCE[0]:-$0}"
+if [ -f "$SELF" ]; then SELF="$(cd "$(dirname "$SELF")" && pwd)/$(basename "$SELF")"; fi
+if [ ! -f "$SELF" ]; then
+  echo "请先把脚本保存成文件再运行 (补丁内嵌在脚本里，管道执行读不到):" >&2
+  echo "  curl -fsSL -o install.sh https://raw.githubusercontent.com/n-yarvex/nakis/main/tool/install.sh && sudo bash install.sh" >&2
+  exit 1
+fi
+HERE="$(cd "$(dirname "$SELF")" && pwd)"
 
 if [ -t 1 ]; then P=$'\e[38;5;211m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; Z=$'\e[0m'; else P=; G=; Y=; R=; Z=; fi
 say()  { echo "${P}(=^･ω･^=)${Z} $*"; }
@@ -48,7 +60,7 @@ nakis-quic 服务端一键脚本
   bash install.sh link            再打印一次分享链接
   bash install.sh port N          改 UDP 端口
   bash install.sh status | logs | restart | stop | start
-  bash install.sh build [all|OS ARCH]   用旁边的源码编译 (自带补丁版 quic-go)，产物在 dist/
+  bash install.sh build [all|OS ARCH]   编译 (自动找源码/克隆、自带补丁版 quic-go)，产物在 ./dist/
   bash install.sh uninstall       卸载
 
 install / update 的选项:
@@ -61,7 +73,7 @@ install / update 的选项:
   --no-firewall 不动防火墙
   --yes         不提问，全用默认
 
-找二进制的顺序: --bin → --url → 脚本旁边的 nakis-quic-linux-<架构> → GitHub Releases ($REPO) → 用脚本旁边的源码编译
+找二进制的顺序: --bin → --url → 脚本旁边的 nakis-quic-linux-<架构> → GitHub Releases ($REPO) → 自动克隆源码并编译 (缺 Go/git/patch 会自动补装)
 EOF
 }
 
@@ -82,51 +94,137 @@ get_bin() { # 把二进制放到 $1
   elif [ -f "$HERE/nakis-quic-linux-$a" ]; then cp "$HERE/nakis-quic-linux-$a" "$out"
   else
     local url="https://github.com/$REPO/releases/latest/download/nakis-quic-linux-$a"
-    say "从 GitHub 下载 (linux/$a)"
-    if ! fetch "$url" "$out" 2>/dev/null; then
-      warn "下载没成功 ($url)"
-      if ls "$HERE"/*.go >/dev/null 2>&1 && have go; then
-        say "本机有 Go，直接用旁边的源码编译"
-        build_bin linux "$a" || die "编译失败"
-        cp "$HERE/dist/nakis-quic-linux-$a" "$out"
-      else
-        die "没有可用的二进制。可以: --bin 文件 / --url 地址，或把源码放在脚本旁边并装好 Go 1.25+ 后重试"
-      fi
+    say "找预编译的二进制 (linux/$a)"
+    if ! fetch "${GH_PROXY%/}${GH_PROXY:+/}$url" "$out" 2>/dev/null || ! is_elf "$out"; then
+      warn "Releases 里还没有二进制，改为下载源码自己编译 (第一次要几分钟)"
+      build_from_source "$a" "$out"
     fi
   fi
   is_elf "$out" || die "拿到的不是 Linux 可执行文件 (可能是 404 页面)"
   chmod 0755 "$out"
 }
 
+pkg_install() {
+  if have apt-get; then DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null; }
+  elif have dnf; then dnf install -y -q "$@" >/dev/null
+  elif have yum; then yum install -y -q "$@" >/dev/null
+  elif have apk; then apk add --no-cache "$@" >/dev/null
+  elif have pacman; then pacman -S --noconfirm --needed "$@" >/dev/null
+  elif have zypper; then zypper -qn install "$@" >/dev/null
+  else return 1; fi
+}
+
+ensure_tools() {
+  local miss=() t
+  for t in git patch tar; do have "$t" || miss+=("$t"); done
+  have curl || have wget || miss+=(curl)
+  [ ${#miss[@]} -eq 0 ] && return 0
+  say "补装工具: ${miss[*]}"
+  pkg_install "${miss[@]}" || die "装不上 ${miss[*]}，请手动安装后重试"
+}
+
+go_ok() { # 有没有 >=1.25.0 的 go
+  have go || return 1
+  local v; v="$(go env GOVERSION 2>/dev/null | sed 's/^go//')"
+  [[ "$v" =~ ^([0-9]+)\.([0-9]+) ]] || return 1
+  [ "${BASH_REMATCH[1]}" -gt 1 ] || [ "${BASH_REMATCH[2]}" -ge 25 ]
+}
+
+ensure_go() {
+  [ -x "$GO_DIR/bin/go" ] && export PATH="$GO_DIR/bin:$PATH"
+  go_ok && return 0
+  local ga; case "$(arch)" in amd64) ga=amd64;; arm64) ga=arm64;; arm) ga=armv6l;; 386) ga=386;; riscv64) ga=riscv64;; esac
+  local v file tmp base got=0
+  tmp="$(mktemp -d)"
+  for v in "$GO_WANT" 1.25.4 1.25.3 1.25.2 1.25.1 1.25.0; do
+    file="go$v.linux-$ga.tar.gz"
+    for base in https://go.dev/dl https://golang.google.cn/dl https://mirrors.aliyun.com/golang; do
+      say "下载 Go $v ($base)"
+      if fetch "$base/$file" "$tmp/go.tgz" 2>/dev/null && tar -tzf "$tmp/go.tgz" >/dev/null 2>&1; then got=1; break 2; fi
+    done
+  done
+  [ $got = 1 ] || { rm -rf "$tmp"; die "下载不到 Go 1.25+。请自己装好 Go (https://go.dev/dl/) 再重试，或设 NQ_GO_VERSION"; }
+  rm -rf "$GO_DIR"; mkdir -p "$GO_DIR"
+  tar -xzf "$tmp/go.tgz" -C "$GO_DIR" --strip-components=1
+  rm -rf "$tmp"
+  export PATH="$GO_DIR/bin:$PATH"
+  go_ok || die "装好的 Go 跑不起来"
+  ok "Go $(go env GOVERSION) 已装到 $GO_DIR"
+}
+
+# 找一份 nakis-quic 的源码 (含 main.go 和 go.mod 的目录)，找不到就克隆
+find_src() {
+  local d
+  for d in "$HERE" "$HERE/nakis-quic" "$HERE/../nakis-quic"; do
+    if [ -f "$d/main.go" ] && [ -f "$d/go.mod" ] && grep -q quic-go "$d/go.mod"; then (cd "$d" && pwd); return 0; fi
+  done
+  local url="https://github.com/$REPO.git"
+  [ -n "$GH_PROXY" ] && url="${GH_PROXY%/}/$url"
+  export GIT_TERMINAL_PROMPT=0
+  if [ -d "$SRC_DIR/.git" ] && git -C "$SRC_DIR" fetch -q --depth 1 "$url" "$BRANCH" 2>/dev/null && git -C "$SRC_DIR" reset -q --hard FETCH_HEAD 2>/dev/null; then
+    :
+  else
+    rm -rf "$SRC_DIR"; mkdir -p "$(dirname "$SRC_DIR")"
+    say "克隆源码: $url ($BRANCH)" >&2
+    git clone -q --depth 1 -b "$BRANCH" "$url" "$SRC_DIR" 2>/dev/null \
+      || die "克隆失败。网络不通的话可以设 NQ_GH_PROXY=https://ghfast.top/ 之类的加速前缀后重试"
+  fi
+  for d in "$SRC_DIR/nakis-quic" "$SRC_DIR"; do
+    if [ -f "$d/main.go" ] && [ -f "$d/go.mod" ] && grep -q quic-go "$d/go.mod"; then echo "$d"; return 0; fi
+  done
+  die "仓库里没找到 nakis-quic 源码 ($SRC_DIR)"
+}
+
+build_from_source() { # build_from_source ARCH OUT
+  ensure_tools; ensure_go
+  local src; src="$(find_src)"
+  say "源码在 $src"
+  local W; W="$(mktemp -d)"
+  build_bin "$src" "$W" linux "$1" || { rm -rf "$W"; die "编译失败，请把上面的报错发给作者"; }
+  cp "$W/nakis-quic-linux-$1" "$2"
+  rm -rf "$W"
+}
+
 # 打补丁的 quic-go (固定在文件末尾)。普通 go build 用的是原版拥塞控制，所以必须走这里。
-build_bin() { # build_bin [all | OS ARCH]
+# build_bin SRC OUTDIR [all | OS ARCH]
+build_bin() {
   have go    || die "需要 Go 1.25+ (https://go.dev/dl/)"
   have patch || die "需要 patch 命令 (apt install patch)"
-  ls "$HERE"/*.go >/dev/null 2>&1 || die "脚本旁边没有 .go 源码"
-  local QG=github.com/quic-go/quic-go VER=v0.61.0 W="$HERE/.build" src
-  rm -rf "$W"; mkdir -p "$W" "$HERE/dist"
+  local src="$1" out="$2"; shift 2
+  local QG=github.com/quic-go/quic-go VER=v0.61.0 W rc
+  W="$(mktemp -d)"
+  mkdir -p "$out"
   (
-    cd "$HERE"
-    export GOFLAGS=-mod=mod
-    go mod download "$QG@$VER"
-    src="$(go list -m -f '{{.Dir}}' "$QG@$VER")"
-    cp -r "$src" "$W/quic-go"; chmod -R u+w "$W/quic-go"
-    sed -n '/^__NQ_PATCH__$/,/^__NQ_PATCH_END__$/p' "${BASH_SOURCE[0]}" | sed '1d;$d' > "$W/quicgo.patch"
-    ( cd "$W/quic-go" && patch -p1 -s < "$W/quicgo.patch" )
+    cd "$src"
+    export GOFLAGS="-mod=mod -buildvcs=false" GOTOOLCHAIN=local
+    export GOPROXY="${NQ_GOPROXY:-https://proxy.golang.org|https://goproxy.cn|direct}"
+    export GOSUMDB="${NQ_GOSUMDB:-sum.golang.org}"
+    say "取 quic-go $VER"
+    # 在一个中性的临时模块里取，免得仓库 go.mod 要求的 Go 版本比本机新时直接报错
+    mkdir -p "$W/stub"; printf 'module stub\n\ngo 1.25.0\n' > "$W/stub/go.mod"
+    local qsrc
+    qsrc="$(cd "$W/stub" && go mod download "$QG@$VER" >&2 && go list -m -f '{{.Dir}}' "$QG@$VER")" || exit 1
+    cp -r "$qsrc" "$W/quic-go"; chmod -R u+w "$W/quic-go"
+    sed -n '/^__NQ_PATCH__$/,/^__NQ_PATCH_END__$/p' "$SELF" | sed '1d;$d' > "$W/quicgo.patch"
+    [ -s "$W/quicgo.patch" ] || { echo "脚本里没读到内嵌补丁 (脚本被改过?)" >&2; exit 1; }
+    ( cd "$W/quic-go" && patch -p1 -s < "$W/quicgo.patch" ) || { echo "补丁没打上 (quic-go 版本不对?)" >&2; exit 1; }
+    # 没有补丁就只是原版拥塞控制，慢很多，所以必须确认真的打上了
+    [ -f "$W/quic-go/internal/congestion/adaptive.go" ] || { echo "补丁看起来没生效" >&2; exit 1; }
     cp go.mod "$W/go.mod"; [ -f go.sum ] && cp go.sum "$W/go.sum" || true
-    go mod edit -modfile="$W/go.mod" -replace "$QG=$W/quic-go"
+    go mod edit -modfile="$W/go.mod" -go=1.25.0 -toolchain=none -replace "$QG=$W/quic-go"
     go mod tidy -modfile="$W/go.mod" >/dev/null 2>&1 || true
+    say "编译中…"
     one() {
       local ext=""; [ "$1" = windows ] && ext=".exe"
-      CGO_ENABLED=0 GOOS="$1" GOARCH="$2" go build -modfile="$W/go.mod" -trimpath -ldflags "-s -w" -o "dist/nakis-quic-$1-$2$ext" . \
-        && echo "  dist/nakis-quic-$1-$2$ext"
+      CGO_ENABLED=0 GOOS="$1" GOARCH="$2" go build -modfile="$W/go.mod" -trimpath -ldflags "-s -w" -o "$out/nakis-quic-$1-$2$ext" . \
+        && echo "  $out/nakis-quic-$1-$2$ext"
     }
     if [ "${1:-}" = all ]; then
-      for t in linux:amd64 linux:arm64 linux:arm linux:386 darwin:arm64 darwin:amd64 windows:amd64 windows:arm64; do one "${t%%:*}" "${t##*:}"; done
-    elif [ $# -ge 2 ]; then one "$1" "$2"
-    else one "$(go env GOOS)" "$(go env GOARCH)"; fi
+      for t in linux:amd64 linux:arm64 linux:arm linux:386 darwin:arm64 darwin:amd64 windows:amd64 windows:arm64; do one "${t%%:*}" "${t##*:}" || exit 1; done
+    elif [ $# -ge 2 ]; then one "$1" "$2" || exit 1
+    else one "$(go env GOOS)" "$(go env GOARCH)" || exit 1; fi
   )
-  local rc=$?
+  rc=$?
   rm -rf "$W"
   return $rc
 }
@@ -368,7 +466,7 @@ case "$cmd" in
   link) show_link;; port) do_port "$@";;
   status) do_status;; logs) journalctl -u nakis-quic -n 100 -f;;
   restart) need_root; svc restart && ok "已重启";; stop) need_root; svc stop;; start) need_root; svc start;;
-  build) build_bin "$@"; echo "好啦 (=^･ω･^=)";;
+  build) ensure_tools; ensure_go; build_bin "$(find_src)" "$PWD/dist" "$@" && echo "好啦 (=^･ω･^=) 产物在 $PWD/dist";;
   uninstall) do_uninstall "$@";; help|-h|--help) usage;;
   *) usage; exit 1;;
 esac
