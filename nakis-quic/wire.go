@@ -24,7 +24,7 @@ const (
 	quietCode quic.ApplicationErrorCode = 0x100
 	byeCode   quic.ApplicationErrorCode = 0x101
 
-	bufMax = 1 << 16
+	bufMax = 1 << 20
 )
 
 const (
@@ -42,7 +42,7 @@ var (
 	errProto   = errors.New("nakis-quic: protocol error")
 )
 
-var tiers [17]sync.Pool
+var tiers [21]sync.Pool
 
 func init() {
 	for i := range tiers {
