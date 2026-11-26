@@ -16,7 +16,7 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-const maxAssocs = 64
+const maxAssocs = 96
 
 var errPrivate = errors.New("target is not allowed")
 
@@ -56,7 +56,17 @@ func NewLair(cfg ServerConfig, logger *slog.Logger) (*Lair, error) {
 		logger: logger,
 		guard:  NewGuard(id),
 		tlsCfg: tlsCfg,
-		qcfg:   quicConfig(cfg.IdleTimeout.D(), cfg.Keepalive.D(), cfg.HandshakeTimeout.D(), cfg.UDP, cfg.MaxStreams),
+		qcfg: quicConfig(
+			cfg.IdleTimeout.D(),
+			cfg.Keepalive.D(),
+			cfg.HandshakeTimeout.D(),
+			cfg.UDP,
+			cfg.MaxStreams,
+			cfg.InitialStreamWindow,
+			cfg.MaxStreamWindow,
+			cfg.InitialConnectionWindow,
+			cfg.MaxConnectionWindow,
+		),
 		names:  NewNames(dnsTTL, lookup),
 		active: map[*quic.Conn]struct{}{},
 	}, nil
