@@ -16,9 +16,9 @@ import (
 )
 
 const (
-	spawnCap  = 4
-	abortWait = 3 * time.Second
-	failFast  = 300 * time.Millisecond
+	spawnCap  = 6
+	abortWait = 4 * time.Second
+	failFast  = 400 * time.Millisecond
 )
 
 type tuning struct {
@@ -135,10 +135,23 @@ func (k *Kitten) abortSessions() {
 	}
 }
 
-func quicConfig(idle, keepalive time.Duration, handshake time.Duration, datagrams bool, maxStreams int) *quic.Config {
-	uni := int64(4)
+func quicConfig(idle, keepalive, handshake time.Duration, datagrams bool, maxStreams int,
+	initStream, maxStream, initConn, maxConn uint64) *quic.Config {
+	uni := int64(16)
 	if maxStreams < 0 {
 		uni = -1
+	}
+	if initStream == 0 {
+		initStream = 16 << 20
+	}
+	if maxStream == 0 {
+		maxStream = 256 << 20
+	}
+	if initConn == 0 {
+		initConn = 32 << 20
+	}
+	if maxConn == 0 {
+		maxConn = 1024 << 20
 	}
 	return &quic.Config{
 		HandshakeIdleTimeout:           handshake,
@@ -147,10 +160,11 @@ func quicConfig(idle, keepalive time.Duration, handshake time.Duration, datagram
 		EnableDatagrams:                datagrams,
 		MaxIncomingStreams:             int64(maxStreams),
 		MaxIncomingUniStreams:          uni,
-		InitialStreamReceiveWindow:     4 << 20,
-		MaxStreamReceiveWindow:         64 << 20,
-		InitialConnectionReceiveWindow: 8 << 20,
-		MaxConnectionReceiveWindow:     256 << 20,
+		InitialStreamReceiveWindow:     initStream,
+		MaxStreamReceiveWindow:         maxStream,
+		InitialConnectionReceiveWindow: initConn,
+		MaxConnectionReceiveWindow:     maxConn,
+		DisablePathMTUDiscovery:        false,
 	}
 }
 
@@ -177,17 +191,27 @@ func NewKitten(cfg ClientConfig, logger *slog.Logger) (*Kitten, error) {
 		ctx:      ctx,
 		cancel:   cancel,
 		active:   map[*sessionRef]struct{}{},
-		tuneFast: tuning{poolHi: cfg.PoolHi, raceN: min(cfg.RaceCount*2, 8)},
+		tuneFast: tuning{poolHi: cfg.PoolHi, raceN: min(cfg.RaceCount*2, 12)},
 		tuneMid:  tuning{poolHi: cfg.PoolHi, raceN: cfg.RaceCount},
-		tuneSlow: tuning{poolHi: min(cfg.PoolLo+4, cfg.PoolHi), raceN: 2},
+		tuneSlow: tuning{poolHi: min(cfg.PoolLo+6, cfg.PoolHi), raceN: 3},
 	}
 	mid := k.tuneMid
 	k.tuneNow.Store(&mid)
 	k.pool = newPurrPool(cfg.PoolHi, cfg.PoolMaxAge.D(), cfg.PoolMaxUses, cfg.Streams)
 	s := &scout{
-		id:        id,
-		tlsCfg:    tlsCfg,
-		qcfg:      quicConfig(cfg.IdleTimeout.D(), cfg.Keepalive.D(), cfg.HandshakeTimeout.D(), cfg.UDP, -1),
+		id:     id,
+		tlsCfg: tlsCfg,
+		qcfg: quicConfig(
+			cfg.IdleTimeout.D(),
+			cfg.Keepalive.D(),
+			cfg.HandshakeTimeout.D(),
+			cfg.UDP,
+			-1,
+			cfg.InitialStreamWindow,
+			cfg.MaxStreamWindow,
+			cfg.InitialConnectionWindow,
+			cfg.MaxConnectionWindow,
+		),
 		handshake: cfg.HandshakeTimeout.D(),
 		probe:     cfg.ProbeInterval.D(),
 		step:      cfg.RaceStagger.D(),
@@ -293,7 +317,7 @@ func (k *Kitten) retune() {
 		raceN:  approach(cur.raceN, goal.raceN),
 	}
 	next.poolHi = min(max(next.poolHi, min(k.cfg.PoolLo+2, k.cfg.PoolHi)), k.cfg.PoolHi)
-	next.raceN = min(max(next.raceN, 2), 12)
+	next.raceN = min(max(next.raceN, 2), 16)
 	k.tuneNow.Store(&next)
 }
 
@@ -317,7 +341,7 @@ func (k *Kitten) noteUp() {
 	k.lastErr = nil
 	k.mu.Unlock()
 	if was >= 3 {
-		k.logger.Info("the server is reachable again, nya~")
+		k.logger.Info("the server is reachable again, nya\~")
 	} else if k.firstUp.CompareAndSwap(false, true) {
 		k.logger.Info("first connection to the server is up")
 	}
@@ -476,7 +500,7 @@ func (k *Kitten) ensure(ctx context.Context) error {
 		k.building = at
 		k.miss++
 		k.misses++
-		width := min(k.tuneNow.Load().raceN+k.fails/2, 12)
+		width := min(k.tuneNow.Load().raceN+k.fails/2, 16)
 		go k.runBuild(at, width)
 	}
 	k.mu.Unlock()
@@ -509,7 +533,7 @@ func (k *Kitten) runBuild(at *attempt, width int) {
 func (k *Kitten) lane(ctx context.Context) (*Lane, error) {
 	skip := map[*Bond]bool{}
 	var lastErr error
-	for round := 0; round < 6; round++ {
+	for round := 0; round < 8; round++ {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
