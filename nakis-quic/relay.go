@@ -10,6 +10,7 @@ import (
 )
 
 const abortCode quic.StreamErrorCode = 0x101
+const relayBufSize = 512 << 10
 
 type half interface {
 	io.ReadWriter
@@ -50,7 +51,7 @@ func relay(a, b half, wait time.Duration) {
 		})
 	}
 	pipe := func(dst, src half) {
-		buf := getBuf(32 << 10)
+		buf := getBuf(relayBufSize)
 		_, err := io.CopyBuffer(plainW{dst}, plainR{src}, buf)
 		putBuf(buf)
 		if err == nil {
