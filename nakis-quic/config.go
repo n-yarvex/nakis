@@ -55,93 +55,109 @@ func problem(code, msg, hint string) *Problem {
 }
 
 type ClientConfig struct {
-	Listen           string   `json:"listen"`
-	Server           string   `json:"server"`
-	UUID             string   `json:"uuid"`
-	SNI              string   `json:"sni"`
-	TLSPins          []string `json:"tls_pins"`
-	ECHConfig        string   `json:"ech_config"`
-	ALPN             []string `json:"alpn"`
-	RaceCount        int      `json:"race_count"`
-	RaceStagger      Span     `json:"race_stagger"`
-	PoolLo           int      `json:"pool_lo"`
-	PoolHi           int      `json:"pool_hi"`
-	PoolMaxAge       Span     `json:"pool_max_age"`
-	PoolMaxUses      int      `json:"pool_max_uses"`
-	Streams          int      `json:"streams"`
-	DialTimeout      Span     `json:"dial_timeout"`
-	HandshakeTimeout Span     `json:"handshake_timeout"`
-	IdleTimeout      Span     `json:"idle_timeout"`
-	Keepalive        Span     `json:"keepalive"`
-	ProbeInterval    Span     `json:"probe_interval"`
-	HalfCloseTimeout Span     `json:"half_close_timeout"`
-	UDP              bool     `json:"udp"`
-	UDPIdleTimeout   Span     `json:"udp_idle_timeout"`
-	DNS              []string `json:"dns"`
-	LogLevel         string   `json:"log_level"`
+	Listen                  string   `json:"listen"`
+	Server                  string   `json:"server"`
+	UUID                    string   `json:"uuid"`
+	SNI                     string   `json:"sni"`
+	TLSPins                 []string `json:"tls_pins"`
+	ECHConfig               string   `json:"ech_config"`
+	ALPN                    []string `json:"alpn"`
+	RaceCount               int      `json:"race_count"`
+	RaceStagger             Span     `json:"race_stagger"`
+	PoolLo                  int      `json:"pool_lo"`
+	PoolHi                  int      `json:"pool_hi"`
+	PoolMaxAge              Span     `json:"pool_max_age"`
+	PoolMaxUses             int      `json:"pool_max_uses"`
+	Streams                 int      `json:"streams"`
+	DialTimeout             Span     `json:"dial_timeout"`
+	HandshakeTimeout        Span     `json:"handshake_timeout"`
+	IdleTimeout             Span     `json:"idle_timeout"`
+	Keepalive               Span     `json:"keepalive"`
+	ProbeInterval           Span     `json:"probe_interval"`
+	HalfCloseTimeout        Span     `json:"half_close_timeout"`
+	UDP                     bool     `json:"udp"`
+	UDPIdleTimeout          Span     `json:"udp_idle_timeout"`
+	DNS                     []string `json:"dns"`
+	LogLevel                string   `json:"log_level"`
+	InitialStreamWindow     uint64   `json:"initial_stream_window"`
+	MaxStreamWindow         uint64   `json:"max_stream_window"`
+	InitialConnectionWindow uint64   `json:"initial_connection_window"`
+	MaxConnectionWindow     uint64   `json:"max_connection_window"`
 
 	noWarm bool
 }
 
 type ServerConfig struct {
-	Listen           string   `json:"listen"`
-	UUID             string   `json:"uuid"`
-	TLSCert          string   `json:"tls_cert"`
-	TLSKey           string   `json:"tls_key"`
-	ECHKeys          []ECHKey `json:"ech_keys"`
-	ALPN             []string `json:"alpn"`
-	DNS              []string `json:"dns"`
-	DialTimeout      Span     `json:"dial_timeout"`
-	HandshakeTimeout Span     `json:"handshake_timeout"`
-	IdleTimeout      Span     `json:"idle_timeout"`
-	Keepalive        Span     `json:"keepalive"`
-	ShutdownTimeout  Span     `json:"shutdown_timeout"`
-	HalfCloseTimeout Span     `json:"half_close_timeout"`
-	UDP              bool     `json:"udp"`
-	UDPIdleTimeout   Span     `json:"udp_idle_timeout"`
-	MaxConns         int      `json:"max_conns"`
-	MaxStreams       int      `json:"max_streams"`
-	AllowPrivate     bool     `json:"allow_private"`
-	LogLevel         string   `json:"log_level"`
+	Listen                  string   `json:"listen"`
+	UUID                    string   `json:"uuid"`
+	TLSCert                 string   `json:"tls_cert"`
+	TLSKey                  string   `json:"tls_key"`
+	ECHKeys                 []ECHKey `json:"ech_keys"`
+	ALPN                    []string `json:"alpn"`
+	DNS                     []string `json:"dns"`
+	DialTimeout             Span     `json:"dial_timeout"`
+	HandshakeTimeout        Span     `json:"handshake_timeout"`
+	IdleTimeout             Span     `json:"idle_timeout"`
+	Keepalive               Span     `json:"keepalive"`
+	ShutdownTimeout         Span     `json:"shutdown_timeout"`
+	HalfCloseTimeout        Span     `json:"half_close_timeout"`
+	UDP                     bool     `json:"udp"`
+	UDPIdleTimeout          Span     `json:"udp_idle_timeout"`
+	MaxConns                int      `json:"max_conns"`
+	MaxStreams              int      `json:"max_streams"`
+	AllowPrivate            bool     `json:"allow_private"`
+	LogLevel                string   `json:"log_level"`
+	InitialStreamWindow     uint64   `json:"initial_stream_window"`
+	MaxStreamWindow         uint64   `json:"max_stream_window"`
+	InitialConnectionWindow uint64   `json:"initial_connection_window"`
+	MaxConnectionWindow     uint64   `json:"max_connection_window"`
 }
 
 func DefaultClient() ClientConfig {
 	return ClientConfig{
-		Listen:           "127.0.0.1:1080",
-		ALPN:             []string{"h3"},
-		RaceCount:        3,
-		PoolLo:           1,
-		PoolHi:           8,
-		PoolMaxAge:       Span(10 * time.Minute),
-		PoolMaxUses:      4096,
-		Streams:          100,
-		DialTimeout:      Span(8 * time.Second),
-		HandshakeTimeout: Span(10 * time.Second),
-		IdleTimeout:      Span(30 * time.Second),
-		Keepalive:        Span(10 * time.Second),
-		ProbeInterval:    Span(2 * time.Second),
-		HalfCloseTimeout: Span(120 * time.Second),
-		UDP:              true,
-		UDPIdleTimeout:   Span(120 * time.Second),
-		LogLevel:         "info",
+		Listen:                  "127.0.0.1:1080",
+		ALPN:                    []string{"h3"},
+		RaceCount:               6,
+		PoolLo:                  4,
+		PoolHi:                  32,
+		PoolMaxAge:              Span(30 * time.Minute),
+		PoolMaxUses:             32768,
+		Streams:                 256,
+		DialTimeout:             Span(18 * time.Second),
+		HandshakeTimeout:        Span(18 * time.Second),
+		IdleTimeout:             Span(90 * time.Second),
+		Keepalive:               Span(20 * time.Second),
+		ProbeInterval:           Span(5 * time.Second),
+		HalfCloseTimeout:        Span(300 * time.Second),
+		UDP:                     true,
+		UDPIdleTimeout:          Span(300 * time.Second),
+		LogLevel:                "info",
+		InitialStreamWindow:     16 << 20,
+		MaxStreamWindow:         256 << 20,
+		InitialConnectionWindow: 32 << 20,
+		MaxConnectionWindow:     1024 << 20,
 	}
 }
 
 func DefaultServer() ServerConfig {
 	return ServerConfig{
-		Listen:           "0.0.0.0:443",
-		ALPN:             []string{"h3"},
-		DialTimeout:      Span(5 * time.Second),
-		HandshakeTimeout: Span(10 * time.Second),
-		IdleTimeout:      Span(30 * time.Second),
-		Keepalive:        Span(10 * time.Second),
-		ShutdownTimeout:  Span(20 * time.Second),
-		HalfCloseTimeout: Span(120 * time.Second),
-		UDP:              true,
-		UDPIdleTimeout:   Span(300 * time.Second),
-		MaxConns:         4096,
-		MaxStreams:       256,
-		LogLevel:         "info",
+		Listen:                  "0.0.0.0:443",
+		ALPN:                    []string{"h3"},
+		DialTimeout:             Span(12 * time.Second),
+		HandshakeTimeout:        Span(18 * time.Second),
+		IdleTimeout:             Span(90 * time.Second),
+		Keepalive:               Span(20 * time.Second),
+		ShutdownTimeout:         Span(40 * time.Second),
+		HalfCloseTimeout:        Span(300 * time.Second),
+		UDP:                     true,
+		UDPIdleTimeout:          Span(480 * time.Second),
+		MaxConns:                8192,
+		MaxStreams:              1024,
+		LogLevel:                "info",
+		InitialStreamWindow:     16 << 20,
+		MaxStreamWindow:         256 << 20,
+		InitialConnectionWindow: 32 << 20,
+		MaxConnectionWindow:     1024 << 20,
 	}
 }
 
@@ -358,18 +374,18 @@ func (c *ClientConfig) Tidy() error {
 	if c.PoolLo < 0 || c.PoolHi < 0 || (c.PoolHi > 0 && c.PoolHi < c.PoolLo) {
 		return problem("C06", "pool_lo must not be larger than pool_hi", "")
 	}
-	c.RaceCount = clamp(c.RaceCount, 2, 12)
-	c.PoolLo = clamp(c.PoolLo, 1, 64)
-	c.PoolHi = clamp(c.PoolHi, c.PoolLo, 256)
+	c.RaceCount = clamp(c.RaceCount, 2, 16)
+	c.PoolLo = clamp(c.PoolLo, 1, 128)
+	c.PoolHi = clamp(c.PoolHi, c.PoolLo, 512)
 	c.PoolMaxUses = clamp(c.PoolMaxUses, 0, 1<<30)
-	c.Streams = clamp(c.Streams, 1, 10000)
-	positive(&c.PoolMaxAge, 10*time.Minute)
-	positive(&c.DialTimeout, 8*time.Second)
-	positive(&c.HandshakeTimeout, 10*time.Second)
-	positive(&c.IdleTimeout, 30*time.Second)
-	positive(&c.Keepalive, 10*time.Second)
-	positive(&c.HalfCloseTimeout, 120*time.Second)
-	positive(&c.UDPIdleTimeout, 120*time.Second)
+	c.Streams = clamp(c.Streams, 1, 32768)
+	positive(&c.PoolMaxAge, 30*time.Minute)
+	positive(&c.DialTimeout, 18*time.Second)
+	positive(&c.HandshakeTimeout, 18*time.Second)
+	positive(&c.IdleTimeout, 90*time.Second)
+	positive(&c.Keepalive, 20*time.Second)
+	positive(&c.HalfCloseTimeout, 300*time.Second)
+	positive(&c.UDPIdleTimeout, 300*time.Second)
 	if c.ProbeInterval < 0 {
 		return problem("C06", "probe_interval must not be negative", "0 turns the health probe off")
 	}
@@ -381,6 +397,24 @@ func (c *ClientConfig) Tidy() error {
 	}
 	if len(c.DNS) > 0 && NewDNSPool(c.DNS) == nil {
 		return problem("C10", "dns has no usable entry", "write them as 1.1.1.1 or 1.1.1.1:53")
+	}
+	if c.InitialStreamWindow == 0 {
+		c.InitialStreamWindow = 16 << 20
+	}
+	if c.MaxStreamWindow == 0 {
+		c.MaxStreamWindow = 256 << 20
+	}
+	if c.InitialConnectionWindow == 0 {
+		c.InitialConnectionWindow = 32 << 20
+	}
+	if c.MaxConnectionWindow == 0 {
+		c.MaxConnectionWindow = 1024 << 20
+	}
+	if c.InitialStreamWindow > c.MaxStreamWindow {
+		c.InitialStreamWindow = c.MaxStreamWindow
+	}
+	if c.InitialConnectionWindow > c.MaxConnectionWindow {
+		c.InitialConnectionWindow = c.MaxConnectionWindow
 	}
 	return nil
 }
@@ -404,19 +438,37 @@ func (s *ServerConfig) Tidy() error {
 		return problem("C09", err.Error(), "")
 	}
 	s.MaxConns = clamp(s.MaxConns, 1, 1<<20)
-	s.MaxStreams = clamp(s.MaxStreams, 8, 100000)
-	positive(&s.DialTimeout, 5*time.Second)
-	positive(&s.HandshakeTimeout, 10*time.Second)
-	positive(&s.IdleTimeout, 30*time.Second)
-	positive(&s.Keepalive, 10*time.Second)
-	positive(&s.ShutdownTimeout, 20*time.Second)
-	positive(&s.HalfCloseTimeout, 120*time.Second)
-	positive(&s.UDPIdleTimeout, 300*time.Second)
+	s.MaxStreams = clamp(s.MaxStreams, 32, 100000)
+	positive(&s.DialTimeout, 12*time.Second)
+	positive(&s.HandshakeTimeout, 18*time.Second)
+	positive(&s.IdleTimeout, 90*time.Second)
+	positive(&s.Keepalive, 20*time.Second)
+	positive(&s.ShutdownTimeout, 40*time.Second)
+	positive(&s.HalfCloseTimeout, 300*time.Second)
+	positive(&s.UDPIdleTimeout, 480*time.Second)
 	if s.Keepalive >= s.IdleTimeout {
 		return problem("S04", "keepalive must be shorter than idle_timeout", "")
 	}
 	if len(s.DNS) > 0 && NewDNSPool(s.DNS) == nil {
 		return problem("S06", "dns has no usable entry", "write them as 1.1.1.1 or 1.1.1.1:53")
+	}
+	if s.InitialStreamWindow == 0 {
+		s.InitialStreamWindow = 16 << 20
+	}
+	if s.MaxStreamWindow == 0 {
+		s.MaxStreamWindow = 256 << 20
+	}
+	if s.InitialConnectionWindow == 0 {
+		s.InitialConnectionWindow = 32 << 20
+	}
+	if s.MaxConnectionWindow == 0 {
+		s.MaxConnectionWindow = 1024 << 20
+	}
+	if s.InitialStreamWindow > s.MaxStreamWindow {
+		s.InitialStreamWindow = s.MaxStreamWindow
+	}
+	if s.InitialConnectionWindow > s.MaxConnectionWindow {
+		s.InitialConnectionWindow = s.MaxConnectionWindow
 	}
 	return nil
 }
@@ -426,8 +478,6 @@ func ParseLevel(name string) (slog.Level, error) {
 	if name == "" {
 		return slog.LevelInfo, nil
 	}
-	if err := l.UnmarshalText([]byte(name)); err != nil {
-		return l, fmt.Errorf("log_level %q is not debug, info, warn or error", name)
-	}
-	return l, nil
+	err := l.UnmarshalText([]byte(name))
+	return l, err
 }
