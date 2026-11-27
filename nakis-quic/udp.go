@@ -15,7 +15,8 @@ import (
 
 const (
 	recordMax = 0xFFFF
-	sentCap   = 1024
+	sentCap   = 2048
+	udpBufSz  = 64 << 10
 )
 
 type deliverer interface {
@@ -38,18 +39,7 @@ func (b *Bond) datagrams() {
 	}
 }
 
-func sendBoth(conn *quic.Conn, st *quic.Stream, wmu *sync.Mutex, id uint16, t target, data []byte) error {
-	if conn.ConnectionState().SupportsDatagrams.Remote {
-		d, err := appendDatagram(nil, id, t, data)
-		if err != nil {
-			return err
-		}
-		err = conn.SendDatagram(d)
-		var tooBig *quic.DatagramTooLargeError
-		if err == nil || !errors.As(err, &tooBig) {
-			return err
-		}
-	}
+func sendRecord(st *quic.Stream, wmu *sync.Mutex, t target, data []byte) error {
 	rec, err := appendRecord(nil, t, data)
 	if err != nil {
 		return err
@@ -179,7 +169,8 @@ loop:
 }
 
 func (a *udpAssoc) up() {
-	buf := make([]byte, 0xFFFF)
+	buf := getBuf(udpBufSz)
+	defer putBuf(buf)
 	for {
 		n, from, err := a.relay.ReadFromUDP(buf)
 		if err != nil {
@@ -197,18 +188,15 @@ func (a *udpAssoc) up() {
 		}
 		a.peer.Store(from)
 		a.last.Store(time.Now().UnixNano())
-		if err := sendBoth(a.lane.b.conn, a.lane.st, &a.wmu, a.id, t, data); err != nil {
-			var tooBig *quic.DatagramTooLargeError
-			if errors.As(err, &tooBig) {
-				continue
-			}
+		if err := sendRecord(a.lane.st, &a.wmu, t, data); err != nil {
 			return
 		}
 	}
 }
 
 func (a *udpAssoc) down() {
-	buf := make([]byte, recordMax)
+	buf := getBuf(recordMax)
+	defer putBuf(buf)
 	for {
 		t, data, err := readRecord(a.lane.st, buf)
 		if err != nil {
@@ -228,7 +216,11 @@ func (a *udpAssoc) deliver(t target, data []byte) {
 		return
 	}
 	a.last.Store(time.Now().UnixNano())
-	_, _ = a.relay.WriteToUDP(append(head, data...), peer)
+	pkt := getBuf(len(head) + len(data))
+	copy(pkt, head)
+	copy(pkt[len(head):], data)
+	_, _ = a.relay.WriteToUDP(pkt[:len(head)+len(data)], peer)
+	putBuf(pkt)
 }
 
 type srvAssoc struct {
@@ -274,7 +266,8 @@ func (s *srvAssoc) deliver(t target, data []byte) {
 }
 
 func (s *srvAssoc) pump() {
-	buf := make([]byte, 0xFFFF)
+	buf := getBuf(udpBufSz)
+	defer putBuf(buf)
 	strikes := 0
 	for {
 		n, from, err := s.pc.ReadFromUDPAddrPort(buf)
@@ -294,9 +287,7 @@ func (s *srvAssoc) pump() {
 			continue
 		}
 		s.last.Store(time.Now().UnixNano())
-		err = sendBoth(s.conn, s.st, &s.wmu, s.id, target{host: ip.String(), port: from.Port()}, buf[:n])
-		var tooBig *quic.DatagramTooLargeError
-		if err != nil && !errors.As(err, &tooBig) {
+		if err := sendRecord(s.st, &s.wmu, target{host: ip.String(), port: from.Port()}, buf[:n]); err != nil {
 			if s.conn.Context().Err() != nil {
 				return
 			}
@@ -308,7 +299,8 @@ func (s *srvAssoc) run(ctx context.Context) {
 	downDone := make(chan struct{})
 	go func() {
 		defer close(downDone)
-		buf := make([]byte, recordMax)
+		buf := getBuf(recordMax)
+		defer putBuf(buf)
 		for {
 			t, data, err := readRecord(s.st, buf)
 			if err != nil {
