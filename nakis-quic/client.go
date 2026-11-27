@@ -341,7 +341,7 @@ func (k *Kitten) noteUp() {
 	k.lastErr = nil
 	k.mu.Unlock()
 	if was >= 3 {
-		k.logger.Info("the server is reachable again, nya\~")
+		k.logger.Info("the server is reachable again, nya~")
 	} else if k.firstUp.CompareAndSwap(false, true) {
 		k.logger.Info("first connection to the server is up")
 	}
